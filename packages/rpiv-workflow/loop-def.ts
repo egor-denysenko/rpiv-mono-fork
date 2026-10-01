@@ -24,6 +24,16 @@ export interface Unit {
 	prompt: string;
 	label: string;
 	id?: string;
+	/**
+	 * Fanout only — the `id ?? label` identities of the units this unit depends
+	 * on. The wave scheduler topologically orders dispatch over these directed
+	 * edges: a unit dispatches only after every unit it lists here has completed
+	 * (its slot filled). Absent/empty ⇒ a root (wave 0). A reference that matches
+	 * no unit's `id ?? label`, or any cycle, halts the stage at the live entry
+	 * (`ensureUnitDeps`). Ignored by the sequential kinds (iterate/assess
+	 * consume the prior unit, so ordering is implicit).
+	 */
+	deps?: readonly string[];
 }
 
 /**
@@ -133,14 +143,16 @@ export interface JudgedRepetition {
  *    would be byte-identical to the original and the model would have no
  *    signal about why it failed); never called when `max` is 1.
  *
- * Runtime: the runner desugars the field into a degenerate assess loop
- * (`max: max ?? 1`, `onCap: "halt"`, `result: "last"`) run by the ONE loop
- * driver. Attempts and verdicts land as unit rows (`role: "produce"` /
- * `role: "verify"`, `unitIndex` = 0-based attempt); the verdict publishes
- * durably to `state.named[judge.outcome.name]` (so declarative fallback
- * routing over `EdgeContext.state.named` works); and `projectResult`
- * restores the last attempt's producer pair before the chain advances —
- * downstream stages never inherit the verdict.
+ * Runtime: the runner desugars the field into a degenerate assess loop run by
+ * the ONE loop driver. The desugar's gate-only defaults (`max`, `onCap`,
+ * `result`) are spelled ONCE in `VERIFY_LOOP_DEFAULTS` (loop-constructors.ts) —
+ * the named peer to `LOOP_DEFAULTS` (verify is not a `LoopDef["kind"]`) —
+ * and consulted by `synthesizeVerifyLoop`. Attempts and verdicts land as unit
+ * rows (`role: "produce"` / `role: "verify"`, `unitIndex` = 0-based attempt);
+ * the verdict publishes durably to `state.named[judge.outcome.name]` (so
+ * declarative fallback routing over `EdgeContext.state.named` works); and
+ * `projectResult` restores the last attempt's producer pair before the chain
+ * advances — downstream stages never inherit the verdict.
  */
 export type VerifySpec = JudgedRepetition;
 
@@ -163,12 +175,15 @@ export type CapPolicy = "halt" | "advance";
 /**
  * What the loop leaves in `{state.output, state.primaryArtifact}` — the PAIR
  * is governed as one (routing + downstream prompts read both):
- * `"entry"` — restore the pair captured at loop entry (fanout default;
- *             reproduces routing-sees-upstream);
- * `"last"`  — the last completed `role: "produce"` unit's pair (iterate /
- *             assess default; zero produce units degrades to entry).
- * Applied at ONE point — loop advance — by the live driver and the resume
- * fold's generation close identically. Mid-loop transient rolls are accepted.
+ * `"entry"` — restore the pair captured at loop entry;
+ * `"last"`  — the last completed `role: "produce"` unit's pair (zero produce
+ *             units degrades to entry).
+ * The per-kind default (`entry` for fanout, `last` for iterate/assess) is
+ * spelled ONCE in `LOOP_DEFAULTS` (loop-constructors.ts) and consulted by each
+ * constructor via `firstDefined` — see that table rather than re-stating the
+ * per-kind literal here. Applied at ONE point — loop advance — by the live
+ * driver and the resume fold's generation close identically. Mid-loop
+ * transient rolls are accepted.
  */
 export type ResultProjection = "entry" | "last";
 
@@ -195,10 +210,74 @@ interface LoopCommon {
 	result: ResultProjection;
 }
 
-/** Parallel-shaped push loop (units still run sequentially today). */
+/** Parallel-shaped push loop — units run in bounded parallel (maxConcurrency). */
 export interface FanoutLoop extends LoopCommon {
 	kind: "fanout";
 	units: FanoutFn;
+	/** Per-fanout concurrency ceiling. Caps in-flight units to
+	 *  `min(concurrency, host maxConcurrency)`; `1` SERIALIZES the loop — the safe
+	 *  model for a fanout whose units mutate SHARED state AND whose write-sets are
+	 *  unknown (so the scheduler cannot derive dep edges and no lane-level scope
+	 *  floor guards the declared set). Absent ⇒ the host cap governs. A fanout
+	 *  whose units carry a declared write-set (`files:`) AND derived `deps` edges
+	 *  AND a lane-level scope floor MAY omit `concurrency`: disjoint-write units run
+	 *  concurrently, a write-overlap edge orders the waves, and the scope floor
+	 *  guards the declared set. Must be an integer ≥ 1 (validated at construction +
+	 *  load). */
+	concurrency?: number;
+	/** Opt out of collect-all: any unit failure halts the run. Default (absent) ⇒
+	 *  collect-all. Under parallel dispatch, the first failing unit halts the
+	 *  run terminally AND cancels in-flight siblings via the per-generation
+	 *  `genAbort` controller: the worker that records the terminal failure fires
+	 *  `genAbort.abort()`, which `session.abort()`s every still-running sibling and
+	 *  drains queued units from the semaphore. Cancelled siblings leave unfilled
+	 *  slots (no row written), so a terminally-failed run that is later resumed
+	 *  re-dispatches them. `genAbort` is also driven by run-level abort (Ctrl-C /
+	 *  `run.signal`), so the same machinery serves both. */
+	failFast?: boolean;
+	/**
+	 * Opt-in halt at generation CLOSE: when a closing generation's every declared
+	 * slot is filled and every one is a failed sentinel (the strict
+	 * all-filled-all-failed condition), the run halts terminally at the loop
+	 * stage with a parent-attributed `FAIL_FANOUT_ALL_FAILED` row instead of
+	 * advancing into a fan-in over an empty channel. An over-cap generation
+	 * under `onCap: "advance"` NEVER qualifies (beyond-cap slots stay
+	 * unfilled, so `filledCount < slots.length`). `failFast` wins when both
+	 * are set — it halts at the FIRST unit failure, before any close. Absent ⇒
+	 * the collect-all contract is unchanged (failed slots become sentinel
+	 * outputs; the chain advances).
+	 */
+	haltWhenAllFailed?: boolean;
+	/**
+	 * Re-dispatch a soft-halted collect-all unit (a failed sentinel in its
+	 * slot) up to `retryHaltedUnits` MORE times. One attempt = the unit's
+	 * whole dispatch: unit start, pre-attempt snapshot, session build,
+	 * execution — so a retry's disk-first collection sees only what the
+	 * retry's own session wrote, and the attempt-1 failure memo rides the
+	 * re-dispatch prompt as the additive suffix (same unit prompt otherwise).
+	 * The fold sees only the FINAL attempt's output. Integer >= 1 when
+	 * present; absent ⇒ exactly one dispatch (the prior contract).
+	 * Collect-all units only — inert under `failFast` (a fail-fast halt
+	 * terminates the run; there is nothing left to re-dispatch into).
+	 * Retries complete inside the per-unit worker before the generation
+	 * folds, so a set `haltWhenAllFailed` close sees only final attempts —
+	 * the halt fires only when every unit's FINAL attempt is a failed
+	 * sentinel; a unit that recovers on retry keeps the generation alive.
+	 */
+	retryHaltedUnits?: number;
+	/**
+	 * When set, the dispatcher injects each completed dependency's published
+	 * artifact path into the dependent unit's prompt as `${depArtifactFlag} <path>`
+	 * (one per direct `Unit.deps` entry whose slot is filled with a non-failed
+	 * output). Pairs with `Unit.deps`: deps order the waves, this flag hands the
+	 * dependent the upstream artifact to read (build `design` sets `"--upstream"`
+	 * so a dependent slice reads its dependency's decided Key Interfaces). A
+	 * failed/sentinel dep slot is skipped — the dependent designs blind for that
+	 * dep, exactly as today. Engine-generic: the flag string is data; the engine
+	 * knows nothing of the consuming skill. Validated non-empty at construction +
+	 * load.
+	 */
+	depArtifactFlag?: string;
 }
 
 /** Sequential accumulating pull loop. */

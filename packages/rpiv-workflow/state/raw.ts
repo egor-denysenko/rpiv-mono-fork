@@ -1,8 +1,7 @@
 /**
  * Raw file-level primitives shared by the readers (`reads.ts`) and the names
  * index (`names.ts`) — a LEAF under both, so neither re-implements the other
- * to dodge a cycle (D9: `names.ts` used to carry its own header-line parse
- * and dir scan).
+ * to dodge a cycle.
  *
  * Fail-soft like the rest of `state/`: both helpers return empty/undefined
  * on any I/O or parse failure, never throw.
@@ -11,8 +10,12 @@
 import { closeSync, openSync, readdirSync, readSync } from "node:fs";
 import { runsDir, stateFilePath } from "./paths.js";
 
-/** Read chunk for the first-line scan. Headers are one short JSON object — one chunk almost always suffices. */
-const FIRST_LINE_CHUNK = 8192;
+/**
+ * Shared one-shot prefix-read size for JSONL first lines — 8KB covers a header
+ * line, so reads stay bounded however large the file. Consumed by the `state/`
+ * first-line reader and the `sessions/` header scan.
+ */
+export const JSONL_PREFIX_READ_BYTES = 8192;
 /** Defensive cap: a "first line" longer than this is not a header we'd accept anyway. */
 const FIRST_LINE_MAX = 256 * 1024;
 
@@ -21,7 +24,7 @@ const FIRST_LINE_MAX = 256 * 1024;
  * (open + chunked `readSync` until the first newline), not a whole-file
  * `readFileSync`. `listRuns` calls this once per run file, so enumerating N
  * past runs costs N small reads regardless of how many stage rows each run
- * accumulated (the perf wart the old whole-file read had).
+ * accumulated.
  *
  * Returns the parsed value (caller shape-checks it), or `undefined` when the
  * file is missing/empty/unparseable. The newline search is byte-level
@@ -39,8 +42,8 @@ export function readFirstJsonlLine(cwd: string, runId: string): unknown {
 		const chunks: Buffer[] = [];
 		let total = 0;
 		while (total < FIRST_LINE_MAX) {
-			const chunk = Buffer.alloc(FIRST_LINE_CHUNK);
-			const n = readSync(fd, chunk, 0, FIRST_LINE_CHUNK, total);
+			const chunk = Buffer.alloc(JSONL_PREFIX_READ_BYTES);
+			const n = readSync(fd, chunk, 0, JSONL_PREFIX_READ_BYTES, total);
 			if (n <= 0) break;
 			const read = chunk.subarray(0, n);
 			const nl = read.indexOf(0x0a);
@@ -50,7 +53,7 @@ export function readFirstJsonlLine(cwd: string, runId: string): unknown {
 			}
 			chunks.push(read);
 			total += n;
-			if (n < FIRST_LINE_CHUNK) break; // EOF before any newline
+			if (n < JSONL_PREFIX_READ_BYTES) break; // EOF before any newline
 		}
 		const line = Buffer.concat(chunks).toString("utf-8").trim();
 		if (!line) return undefined;

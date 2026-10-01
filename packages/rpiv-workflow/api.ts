@@ -1,5 +1,5 @@
 /**
- * Public authoring surface for rpiv workflows — a BARREL since the M9 split.
+ * Public authoring surface for rpiv workflows — a BARREL.
  * Users import everything they need (`defineWorkflow`, `produces`, `acts`,
  * `defineRoute`, `gate`, `STOP`, `marksReadsData`, schema adapters, plus the
  * type vocabulary `Workflow` / `StageDef` / `EdgeFn` / `EdgeTarget` /
@@ -18,6 +18,9 @@
  *   ./loop-def.ts    — the loop vocabulary (LoopDef kinds, JudgedRepetition,
  *                      VerifySpec, Unit, contexts, LOOP_KINDS); constructors
  *                      stay in loop-constructors.ts
+ *   ./output-spec.ts — the `Outcome` type (type-only re-export; the wired-up
+ *                      collector/parser pair a stage declares via
+ *                      `StageDef.outcome`)
  *   ./routing-dsl.ts — EdgeFn/EdgeTarget/STOP, defineRoute, gate, the
  *                      READS_DATA / ROUTE_NOTE markers
  */

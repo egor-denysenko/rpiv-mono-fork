@@ -12,7 +12,7 @@
  *
  * Internally split into three modules:
  *   - paths.ts  — runsDir + stateFilePath + generateRunId
- *   - writes.ts — tryAppendJsonl + writeHeader + appendStage +
+ *   - writes.ts — tryAppendJsonl + appendHeader + appendStage +
  *                 appendRoutingDecision
  *   - reads.ts  — readLastStage + readAllStages + readRoutingDecisions +
  *                 listArtifacts + readHeader + listRuns
@@ -29,6 +29,15 @@ import type { RunTrigger } from "../triggers.js";
 // Row shapes
 // ---------------------------------------------------------------------------
 
+/**
+ * On-disk status stamped on every `WorkflowStage` row. `"skipped"` is the
+ * FROZEN on-disk marker for a user-cancellation: the canonical in-memory name
+ * is `RunTermination.status: "cancelled"` (../types.ts), and the sole writer of
+ * a `"skipped"` row is `recordCancellation` (../audit.ts). The split is
+ * deliberate — the row value is a versioned on-disk contract (see
+ * `STATE_SCHEMA_VERSION`), so it keeps its long-standing spelling even though
+ * the in-memory outcome reads "cancelled". Literal unchanged.
+ */
 export type StageStatus = "completed" | "failed" | "skipped" | "aborted";
 
 /**
@@ -94,12 +103,22 @@ export interface WorkflowStage {
 	output?: Output;
 	/**
 	 * Reason a terminal-failure row was written — mirrors the
-	 * `state.termination.error` set by `recordTerminalFailure`. Present
+	 * `state.termination.error` set by `recordFatalFailure`. Present
 	 * only on `status: "failed" | "aborted"` rows; absent on completed /
 	 * skipped rows. Persisting it here means post-mortems work from
 	 * JSONL alone, without depending on a transient `ctx.ui.notify` toast.
 	 */
 	errMsg?: string;
+	/**
+	 * Strike-history observability — present ONLY on a `status: "completed"`
+	 * row whose session recovered from one or more bash overruns: `count` is the
+	 * strikes consumed, `reasons` lists each consumed strike's host reason. An
+	 * ADDITIVE optional field (NOT a new row kind): absent ⇒ `JSON.stringify`
+	 * drops it ⇒ byte-identical row to pre-feature; the resume fold's
+	 * shape-filtered readers ignore it (like `errMsg`), so no
+	 * `STATE_SCHEMA_VERSION` bump.
+	 */
+	bashTimeoutStrikes?: { count: number; reasons: string[] };
 	/**
 	 * REQUIRED: the Pi session that backed this activation, or `null` as an
 	 * explicit statement that no session was involved (script stages,
@@ -114,6 +133,37 @@ export interface WorkflowStage {
 	role?: UnitRole;
 	unitId?: string;
 	unitIndex?: number;
+	/**
+	 * Marks a NON-terminal collect-all fanout unit halt (`recordUnitHalt`):
+	 * the unit failed but the run survives and a `failedOutput` sentinel fills its
+	 * declared slot. Distinguishes a SOFT halt from a hard `recordFatalFailure`
+	 * row (byte-identical otherwise) so the resume fold rebuilds the
+	 * sentinel by `unitIndex` rather than re-dispatching the unit. Absent on every
+	 * other row (`undefined` is dropped by `JSON.stringify`).
+	 */
+	collected?: true;
+	/**
+	 * The failed unit's label — present ONLY on a `collected: true` row, where
+	 * `recordUnitHalt` writes it so the resume fold can thread it into the
+	 * rebuilt `failedOutput` sentinel's `dimension` (live sentinel and resume
+	 * twin stay byte-identical). An ADDITIVE optional field in the
+	 * `bashTimeoutStrikes` style: absent ⇒ `JSON.stringify` drops it ⇒
+	 * byte-identical row; the fold's shape-filtered readers ignore it, so no
+	 * `STATE_SCHEMA_VERSION` bump.
+	 */
+	unitLabel?: string;
+	/**
+	 * The failed attempt's 1-based dispatch ordinal — present ONLY on a
+	 * `collected: true` row, where `recordUnitHalt` writes it (threaded from
+	 * the parallel dispatcher's per-attempt count). Consumed by the resume
+	 * fold's budget predicate (`foldFanoutRow` in runner/resume.ts): an
+	 * under-budget ordinal leaves the slot unfilled so the unit re-dispatches
+	 * while `retryHaltedUnits` budget remains; a final-attempt (or absent)
+	 * ordinal folds the sentinel, exactly as before v3. THE schema-v3 delta —
+	 * collected-row fold behavior is version-gated, so v1/v2 trails refuse
+	 * resume rather than mis-replay.
+	 */
+	attemptOrdinal?: number;
 }
 
 /**
@@ -137,10 +187,23 @@ export interface LoopCapRow {
  * `reconstructState` refuses headers carrying any other version
  * (`reason: "version-mismatch"`) instead of silently mis-replaying.
  *
- * BACK-COMPAT RULE: an absent `v` is version 1 — files written before the
- * field existed resume normally. Tested in `runner/resume.test.ts`.
+ * v2 = parallel-fanout trails: completion rows are placed by `unitIndex` (not
+ * trail order), and a `collected:true` failed row's `errMsg` rebuilds a
+ * `failedOutput` sentinel. Still true under v3.
+ *
+ * v3 = budget-aware collected rows: a `collected:true` row carries the failed
+ * attempt's 1-based `attemptOrdinal`, and the resume fold re-dispatches the
+ * unit while `retryHaltedUnits` budget remains (an under-budget collected row
+ * leaves its slot unfilled, exactly like a pending one) instead of folding
+ * its sentinel; the retry budget is fresh per resume invocation (ordinals
+ * restart at 1, bounded only by human-initiated resumes).
+ *
+ * A v1 or v2 trail — and an absent `v`, which resolves to 1 — is rejected by
+ * `reconstructState`'s header version gate with `version-mismatch` ("start a
+ * fresh run"): there is no in-place migration (sole consumer rpiv-pi; no
+ * back-compat). Tested in `runner/resume.test.ts`.
  */
-export const STATE_SCHEMA_VERSION = 1;
+export const STATE_SCHEMA_VERSION = 3;
 
 /** First line of the JSONL file. */
 export interface WorkflowHeader {
@@ -185,6 +248,69 @@ export interface RunSummary {
 	name?: string;
 }
 
+/**
+ * Terminal-state projection of one run's JSONL trail — the post-mortem recap
+ * a lane renders on end-of-run (computed by `summarizeRun`). Flat (NOT a
+ * discriminated union mirroring `RunTermination`): `failureReason` is optional
+ * because it is sourced from `WorkflowStage.errMsg`, which is optional on the
+ * persisted row and unenforced by `isWorkflowStage` — a union requiring it on
+ * non-completed arms would assert a guarantee legacy/truncated trails do not
+ * make. Does NOT extend `RunSummary` (different projection: terminal state
+ * vs. header/start state).
+ *
+ * `outcome` is the recap outcome set ("completed" / "stopped" / "failed" /
+ * "cancelled" / "aborted") — a subset of a host's lane-status vocabulary with
+ * NO "running" member, since a recap only exists for a terminal run.
+ * `summarizeRun` derives it from the on-disk `StageStatus` via the lone
+ * `"skipped"`→`"cancelled"` translation (see `STAGE_TO_RECAP_OUTCOME`); the
+ * other three pass through. `"stopped"` never comes from a stage status: it is
+ * the routed-stop refinement of `"completed"` — the trail's LAST row is a
+ * `RoutingDecision` with `decision: "stop"`, i.e. a gate terminated the run
+ * before its linear chain reached a natural end (a stop-on-fail preset's red
+ * gate). The runner itself reports such a run "completed"; only the recap
+ * distinguishes it, so hosts can surface "stopped at <gate>" instead of a
+ * success reading.
+ */
+export interface RunRecap {
+	outcome: "completed" | "stopped" | "failed" | "cancelled" | "aborted";
+	/**
+	 * One display string per artifact, in trail order, projected through
+	 * `handleToString` (`fs`→path, `url`→href, `opaque`→id, `inline`→byte
+	 * length). Includes artifacts from stages that completed before a later
+	 * failure (NO `status === "completed"` filter — `summarizeRun` projects via
+	 * `listArtifacts`, which reads every stage row). `[]` when no stage carried
+	 * artifacts.
+	 */
+	artifacts: string[];
+	/**
+	 * Reason a non-completed run terminated — sourced from the LAST stage row's
+	 * `errMsg`, which mirrors the in-memory `state.termination.error` set by
+	 * `recordFatalFailure` / `recordCancellation` (present only on
+	 * `"failed" | "aborted" | "skipped"`-translated rows). Optional because
+	 * `errMsg` is optional on the persisted row: a legacy/truncated trail may
+	 * carry no reason even on a terminal row.
+	 */
+	failureReason?: string;
+	/**
+	 * Route-note recap: every note-bearing FORWARD routing row's `note`,
+	 * verbatim, in trail order. Stop-row notes are EXCLUDED — the
+	 * completed→stopped refinement renders a stop's note exactly once, as
+	 * `failureReason` (`stopped at <stage>: <note>`); a trail-order echo would
+	 * double-render it. Set only when at least one such row exists; absent
+	 * (never `[]`) otherwise, so note-less and legacy trails project
+	 * byte-identically. Rides EVERY outcome — a failed run may carry earlier-hop
+	 * notes (a gate explained itself before a later stage blew up).
+	 */
+	routingNotes?: string[];
+	/**
+	 * Workflow name (matches `Workflow.name` at run-time) projected from the
+	 * header. `undefined` when the header row is missing or malformed (a
+	 * degraded trail with stage rows still returns a recap; the gap surfaces
+	 * explicitly so a caller renders the outcome without the name).
+	 */
+	workflow?: string;
+}
+
 export interface RoutingDecision {
 	type: "routing";
 	fromStageIndex: number;
@@ -207,6 +333,7 @@ export {
 	type ClaimResult,
 	claimName,
 	isValidName,
+	MAX_NAME_LENGTH,
 	type NamesIndex,
 	readNamesIndex,
 	rebuildIndex,
@@ -223,6 +350,7 @@ export {
 	readLastStage,
 	readLoopCaps,
 	readRoutingDecisions,
+	summarizeRun,
 } from "./reads.js";
 export { resolveRun } from "./resolve.js";
-export { appendLoopCap, appendRoutingDecision, appendStage, writeHeader } from "./writes.js";
+export { appendHeader, appendLoopCap, appendRoutingDecision, appendStage } from "./writes.js";

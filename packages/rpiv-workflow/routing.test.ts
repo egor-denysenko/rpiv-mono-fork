@@ -32,6 +32,7 @@ const makeState = (outputData?: Record<string, unknown>): RunState => ({
 		droppedRoutingRows: [],
 		droppedFailureRows: [],
 	},
+	failureMemos: [],
 	termination: { status: "running" },
 });
 

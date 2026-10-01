@@ -3,6 +3,7 @@ name: explore
 description: Analyze solution options for a feature or change, comparing approaches with pros, cons, trade-offs, and a recommended path. Use when the user is weighing approaches, asks "what are the options" or "how should we approach X", wants approaches compared, says "explore solutions", or faces a decision with multiple valid implementations. Produces solutions documents in .rpiv/artifacts/solutions/, which can feed the design skill.
 argument-hint: "[feature/change description]"
 shell-timeout: 10
+disable-model-invocation: true
 contract:
   produces:
     kind: produces
@@ -109,6 +110,7 @@ Present the candidate set and default dimensions to the developer before per-can
    ```
 
 2. **Confirm via the `ask_user_question` tool with the following question:** "{N} candidates, {D} dimensions. Begin per-candidate fit dispatch?". Header: "Candidates". Options: "Proceed (Recommended)" (Begin per-candidate fit dispatch with all {N} candidates and all {D} dimensions); "Adjust candidates or dimensions" (Rename, add, or drop candidates; drop dimensions that don't apply); "Re-generate candidates" (Candidates look wrong — re-run Step 2 with adjusted scope).
+   - `Header` is capped at ≤16 characters (`MAX_HEADER_LENGTH = 16` — longer values are rejected).
 
 3. **Handle developer input:**
 

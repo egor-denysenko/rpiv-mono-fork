@@ -27,7 +27,7 @@ import type { BranchEntry } from "./transcript.js";
 // Snapshot — pre-stage reference capture (shared by collector + parser)
 // ---------------------------------------------------------------------------
 
-export interface SnapshotCtx {
+export interface SnapshotContext {
 	cwd: string;
 	runId: string;
 	stageIndex: number;
@@ -45,12 +45,21 @@ export interface SnapshotCtx {
  * prefix without re-materialising a slice. `snapshot` is whatever the
  * collector's optional `snapshot` hook returned.
  */
-export interface CollectCtx<Snapshot = unknown> extends SnapshotCtx {
+export interface CollectContext<Snapshot = unknown> extends SnapshotContext {
 	branch: BranchEntry[];
 	branchOffset?: number;
 	snapshot: Snapshot;
 	/** Filled by the runner; collectors MUST NOT set this themselves. */
 	skill: string;
+	/**
+	 * Present iff this session IS one loop unit — the unit's display label.
+	 * Grade panels label each dimension unit with the dimension it grades, so
+	 * there it IS the verdict dimension; a collector may narrow collection to
+	 * it (the disk-first verdict collector's determined-name tightness).
+	 * Absent for single stages and unlabeled wirings — those collectors must
+	 * degrade to their loose shapes, never fatal on what they accepted before.
+	 */
+	unitLabel?: string;
 }
 
 /**
@@ -64,7 +73,7 @@ export interface CollectCtx<Snapshot = unknown> extends SnapshotCtx {
  *   `kind: "fatal"`                              — collector cannot satisfy its contract;
  *                                                   runner halts with the carried message.
  *
- * THE "NOTHING FOUND" CONVENTION (T10) — what a collector returns when it
+ * THE "NOTHING FOUND" CONVENTION — what a collector returns when it
  * comes up empty depends on WHY it's empty, and the two must never be
  * conflated:
  *
@@ -97,8 +106,8 @@ export type CollectResult = { kind: "ok"; artifacts: readonly Artifact[] } | { k
  * widening at every call site.
  */
 export interface ArtifactCollector<Snapshot = unknown> {
-	snapshot?(ctx: SnapshotCtx): Promise<Snapshot> | Snapshot;
-	collect(ctx: CollectCtx<Snapshot>): Promise<CollectResult> | CollectResult;
+	snapshot?(ctx: SnapshotContext): Promise<Snapshot> | Snapshot;
+	collect(ctx: CollectContext<Snapshot>): Promise<CollectResult> | CollectResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,12 +115,12 @@ export interface ArtifactCollector<Snapshot = unknown> {
 // ---------------------------------------------------------------------------
 
 /**
- * Context handed to a parser's `parse`. Extends `CollectCtx` with the
+ * Context handed to a parser's `parse`. Extends `CollectContext` with the
  * `artifacts` the matching collector just returned, so parsers can
  * narrow on `artifacts[0].handle.kind` and inspect any `meta` the
  * collector attached. `snapshot` flows through unchanged.
  */
-export interface ParseCtx<Snapshot = unknown> extends CollectCtx<Snapshot> {
+export interface ParseContext<Snapshot = unknown> extends CollectContext<Snapshot> {
 	artifacts: readonly Artifact[];
 }
 
@@ -133,7 +142,7 @@ export type ParseResult<Kind extends string = string, Data = unknown> =
  * Method shorthand for the same bivariance reason as `ArtifactCollector`.
  */
 export interface ArtifactParser<Snapshot = unknown, Kind extends string = string, Data = unknown> {
-	parse(ctx: ParseCtx<Snapshot>): Promise<ParseResult<Kind, Data>> | ParseResult<Kind, Data>;
+	parse(ctx: ParseContext<Snapshot>): Promise<ParseResult<Kind, Data>> | ParseResult<Kind, Data>;
 }
 
 // ---------------------------------------------------------------------------

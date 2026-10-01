@@ -4,38 +4,50 @@
 // trace of what the runner does and — crucially for the thesis — where the
 // driver decides. The "you" hanko ticks mark the human moments.
 const COMMANDS = [
-	{ cmd: "/wf", note: "preview every flow: what each one chains, shortest to deepest." },
-	{ cmd: "/wf build", note: "inspect the graph before committing to it: stages, gate, loop." },
+	{ cmd: "/wf", note: "preview every pipeline: what each one chains, shortest to deepest." },
+	{ cmd: "/wf build", note: "inspect the graph before committing to it: 30 stages, three gates, one design review." },
 	{ cmd: "/wf build “describe your change”", note: "run the whole chain. Your brief is the only required input." },
 ];
 
+// build's seven acts (30 runtime stages). `you` renders the driver badge —
+// hollow ▢ where ask_user_question reaches you only when the code can't
+// decide, solid ■ at the guaranteed design gate; `gate` renders the act's
+// quality-gate badge.
 const TRACE = [
 	{
-		name: "research",
-		note: "subagents fan out under fresh context; grounded questions come back to you before the doc is written.",
-		you: true,
+		name: "capture",
+		note: "your brief goes to disk byte-for-byte. No LLM touches it. Research then grounds it in your codebase, asking on ambiguity and confirming with you before it writes. Every gate downstream grades against your exact words.",
+		you: "▢ your answers",
 	},
 	{
-		name: "blueprint",
-		note: "the plan pauses at micro-checkpoints. Your call before any code is written.",
-		you: true,
+		name: "slice",
+		note: "the brief is cut into independent vertical slices, each small enough for one design pass. You confirm the cut once. That freezes the coverage units a script then conserves: cycle-free, no piece of your ask dropped.",
+		you: "▢ your cut",
+		gate: "gate · script floor + 1 judgment · ↺ fix",
 	},
 	{
-		name: "implement",
-		note: "fans out across the plan's phases, each verified against its success criteria.",
+		name: "design",
+		note: "one fresh session per slice, dependency-ordered, all running at once. Every lane is live in the console. A genuine design fork reaches you without halting the others.",
+		you: "▢ your forks",
 	},
 	{
-		name: "validate",
-		note: "the finished work re-checked phase by phase against the plan.",
+		name: "review",
+		note: "your design gate, the pause that carries real judgment: every slice's design in one summary. Accept, or adjust interfaces and data types; the edit cascades to dependents before synthesis.",
+		you: "■ your design gate",
 	},
 	{
-		name: "code-review",
-		note: "gates on a contract-validated blockers_count and loops back until it reads zero.",
-		loop: true,
+		name: "plan",
+		note: "per-cluster sub-plans merge into one plan. A tier-scaled panel grades it before any code exists — correctness and completeness on a clean one-slice, two-phase run, the full five-dimension roster on anything larger; completeness and correctness are judged against your verbatim brief.",
+		gate: "gate · panel · ↺ fix",
 	},
 	{
-		name: "commit",
-		note: "grouped logically, message written, your name on the diff.",
+		name: "code",
+		note: "implement-ready code elaborated per phase in parallel, spliced into the plan by a script, and the code-bearing plan re-graded.",
+		gate: "gate · ↺ fix",
+	},
+	{
+		name: "land",
+		note: "phases implemented as dependency-gated waves — independent phases run at once, phases sharing a write-set stay ordered — then the result is validated against your brief. You confirm the commit plan; your name goes on the diff.",
 	},
 ];
 ---
@@ -73,8 +85,8 @@ const TRACE = [
 							<div class="fr__body">
 								<p class="fr__name mono">
 									{t.name}
-									{t.you && <span class="fr__you mono">■ you</span>}
-									{t.loop && <span class="fr__loop mono">↺ ≤ 3 passes</span>}
+									{t.you && <span class="fr__you mono">{t.you}</span>}
+									{t.gate && <span class="fr__gate mono">{t.gate}</span>}
 								</p>
 								<p class="fr__note">{t.note}</p>
 							</div>
@@ -202,7 +214,7 @@ const TRACE = [
 		color: var(--ochre);
 		letter-spacing: 0.1em;
 	}
-	.fr__loop {
+	.fr__gate {
 		font-size: var(--type-tiny);
 		color: var(--text-distant);
 		letter-spacing: 0.06em;

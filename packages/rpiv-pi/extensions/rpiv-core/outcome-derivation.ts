@@ -28,7 +28,10 @@ import { isModuleNotFound } from "./utils.js";
 export const BUCKET_BY_KIND: Readonly<Record<string, string>> = {
 	plan: "plans",
 	research: "research",
+	acceptance: "acceptance",
+	slices: "slices",
 	design: "designs",
+	elaboration: "elaborations",
 	solutions: "solutions",
 	review: "reviews",
 	validation: "validation",

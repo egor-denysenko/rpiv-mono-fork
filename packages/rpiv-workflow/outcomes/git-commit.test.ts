@@ -3,7 +3,7 @@
  * on the success path, when git isn't on PATH, and when the working
  * tree isn't a git repo.
  *
- * Failure posture (C10): no-baseline (not a git repo at snapshot time) and
+ * Failure posture: no-baseline (not a git repo at snapshot time) and
  * HEAD-unchanged degrade to an honest `noOp: true` payload; git WORKING at
  * snapshot time but FAILING after the stage is `fatal` — fabricating noOp
  * there would let `gate` route on invented data. The parser is pure: it
@@ -15,7 +15,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { CollectCtx, ParseCtx, SnapshotCtx } from "../output-spec.js";
+import type { CollectContext, ParseContext, SnapshotContext } from "../output-spec.js";
 import {
 	type GitHeadSnapshot,
 	gitCommitCollector,
@@ -40,14 +40,17 @@ const initRepo = (cwd: string): void => {
 	execSync("git commit --allow-empty -q -m initial", { cwd });
 };
 
-const snapshotCtx = (cwd: string): SnapshotCtx => ({
+const snapshotCtx = (cwd: string): SnapshotContext => ({
 	cwd,
 	runId: "test-run",
 	stageIndex: 0,
 	state: { originalInput: "", output: undefined, named: {} },
 });
 
-const collectCtx = (cwd: string, snapshot: GitHeadSnapshot | undefined): CollectCtx<GitHeadSnapshot | undefined> => ({
+const collectCtx = (
+	cwd: string,
+	snapshot: GitHeadSnapshot | undefined,
+): CollectContext<GitHeadSnapshot | undefined> => ({
 	...snapshotCtx(cwd),
 	branch: [],
 	branchOffset: undefined,
@@ -64,7 +67,7 @@ const runOutcome = async (cwd: string, snapshot: GitHeadSnapshot | undefined) =>
 	const ctx = collectCtx(cwd, snapshot);
 	const collected = await gitCommitOutcome.collector.collect(ctx);
 	if (collected.kind === "fatal") return collected;
-	const parseCtx: ParseCtx<GitHeadSnapshot | undefined> = { ...ctx, artifacts: collected.artifacts };
+	const parseCtx: ParseContext<GitHeadSnapshot | undefined> = { ...ctx, artifacts: collected.artifacts };
 	return gitCommitOutcome.parser!.parse(parseCtx);
 };
 
@@ -128,6 +131,28 @@ describe.runIf(hasGit)("gitCommitOutcome end-to-end", () => {
 		expect(data.noOp).toBeUndefined();
 	});
 
+	it("journals EVERY commit in prevSha..headSha, oldest-first (not just the head)", async () => {
+		initRepo(tmpDir);
+		const snap = await gitHeadSnapshot(snapshotCtx(tmpDir));
+
+		writeFileSync(join(tmpDir, "a.txt"), "a\n");
+		execSync("git add a.txt", { cwd: tmpDir });
+		execSync('git commit -q -m "add a"', { cwd: tmpDir });
+		writeFileSync(join(tmpDir, "b.txt"), "b\n");
+		execSync("git add b.txt", { cwd: tmpDir });
+		execSync('git commit -q -m "add b"', { cwd: tmpDir });
+
+		const result = await runOutcome(tmpDir, snap);
+		expect(result.kind).toBe("ok");
+		if (result.kind !== "ok") return;
+		const data = result.payload.data;
+		// Head fields still describe the LATEST commit (back-compat).
+		expect(data.subject).toBe("add b");
+		// …but every earlier-phase commit is now visible, oldest-first.
+		expect(data.commits?.map((c) => c.subject)).toEqual(["add a", "add b"]);
+		expect(data.commits?.every((c) => /^[0-9a-f]{40}$/.test(c.sha))).toBe(true);
+	});
+
 	it("emits noOp payload when HEAD did not move", async () => {
 		initRepo(tmpDir);
 		const snap = await gitHeadSnapshot(snapshotCtx(tmpDir));
@@ -145,7 +170,7 @@ describe.runIf(hasGit)("gitCommitOutcome end-to-end", () => {
 		expect(result.payload.data.noOp).toBe(true);
 	});
 
-	it("goes FATAL when git worked at snapshot time but fails after the stage (C10)", async () => {
+	it("goes FATAL when git worked at snapshot time but fails after the stage", async () => {
 		// Synthesize a snapshot with a fake baseline; collect runs in a non-repo
 		// cwd — the environment broke mid-stage. Pre-fix this fabricated a
 		// noOp payload and `gate` routed on invented data.
@@ -199,8 +224,8 @@ describe.runIf(hasGit)("gitCommitCollector emits one meta-complete artifact on n
 	});
 });
 
-describe("gitCommitParser is pure and validates its meta contract (C10)", () => {
-	const parseWith = (artifacts: ParseCtx<GitHeadSnapshot | undefined>["artifacts"]) =>
+describe("gitCommitParser is pure and validates its meta contract", () => {
+	const parseWith = (artifacts: ParseContext<GitHeadSnapshot | undefined>["artifacts"]) =>
 		gitCommitParser.parse({ ...collectCtx("/nonexistent", undefined), artifacts });
 
 	it("goes fatal when handed an artifact with a foreign meta shape", async () => {

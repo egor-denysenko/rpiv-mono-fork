@@ -3,6 +3,7 @@ name: revise
 description: Surgically update an existing implementation plan in .rpiv/artifacts/plans/ based on review feedback, mid-implementation discoveries, or new constraints, preserving structure and quality rather than rewriting. Use when the user wants a plan adjusted after code-review feedback, has hit a blocker mid-implement, scope changed, or asks to "revise the plan".
 argument-hint: "[plan-path | --plans <path> --reviews <path>] [feedback]"
 shell-timeout: 10
+disable-model-invocation: true
 contract:
   produces:
     kind: produces
@@ -154,6 +155,7 @@ I plan to update the plan by:
 Does this align with your intent?
 ```
 
+`Header` is capped at ≤16 characters (`MAX_HEADER_LENGTH = 16` — longer values are rejected).
 Use the `ask_user_question` tool to confirm before editing. Question: "{Summary of planned modifications}. Proceed with these edits?". Header: "Changes". Options: "Proceed (Recommended)" (Apply the planned changes to the existing plan); "Adjust approach" (Modify what will be changed before editing); "Show me first" (Show the exact text changes before applying).
 
 ### Step 4: Update the Plan

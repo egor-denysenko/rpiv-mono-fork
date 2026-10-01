@@ -1,6 +1,6 @@
 {
 	"name": "@juicesharp/rpiv-workflow",
-	"version": "1.20.0",
+	"version": "2.12.0",
 	"description": "Pi extension. Chain skills into typed multi-stage workflows with audited JSONL state, predicate routing, and per-stage output validation. Skill-agnostic — bring your own skills.",
 	"keywords": [
 		"pi-package",
@@ -35,15 +35,22 @@
 		"internal.ts",
 		"api.ts",
 		"stage-def.ts",
+		"stage-identity.ts",
+		"stage-errors.ts",
 		"loop-def.ts",
 		"routing-dsl.ts",
 		"audit.ts",
+		"audit-ctx.ts",
 		"audit-rows.ts",
 		"built-ins.ts",
 		"chain-state.ts",
 		"command.ts",
 		"command-run.ts",
+		"death-scene.ts",
+		"execution-host.ts",
+		"failure-memos.ts",
 		"loop-constructors.ts",
+		"loops/",
 		"extension.ts",
 		"registration.ts",
 		"handle.ts",
@@ -56,6 +63,8 @@
 		"events.ts",
 		"loop.ts",
 		"loop-kinds.ts",
+		"loop-parallel.ts",
+		"loop-waves.ts",
 		"load/",
 		"output.ts",
 		"messages.ts",
@@ -67,6 +76,7 @@
 		"skill-contracts/",
 		"routing.ts",
 		"runner/",
+		"semaphore.ts",
 		"startup.ts",
 		"sessions/",
 		"state/",
@@ -75,10 +85,15 @@
 		"typebox-adapter.ts",
 		"types.ts",
 		"validate-output.ts",
+		"validation-bounds.ts",
 		"validate-workflow.ts",
 		"validate/",
+		"worktree-digest.ts",
 		"docs-protocol.ts",
 		"docs/",
+		"!docs/*.png",
+		"!docs/*.jpg",
+		"!docs/*.svg",
 		"README.md",
 		"LICENSE",
 		"!**/*.test.ts"
@@ -91,17 +106,18 @@
 		"./internal": "./internal.ts"
 	},
 	"pi": {
+		"image": "https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-workflow/docs/cover.png",
 		"extensions": [
 			"./extension.ts"
 		]
 	},
 	"dependencies": {
-		"@juicesharp/rpiv-config": "^1.20.0",
-		"jiti": "^2.7.0",
-		"typebox": "^1.1.24"
+		"@juicesharp/rpiv-config": "^2.12.0",
+		"jiti": "^2.7.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
-		"@standard-schema/spec": "*"
+		"@standard-schema/spec": "*",
+		"typebox": "*"
 	}
 }

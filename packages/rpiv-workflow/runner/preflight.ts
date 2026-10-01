@@ -1,7 +1,7 @@
 /**
  * Runtime preflights for the per-stage pipeline — every check that gates a
  * stage BEFORE its body dispatches. Each check throws `StagePreflightError`
- * on failure; `runStageOrRecordFailure` (run-stage.ts) catches and
+ * on failure; `dispatchStageOrRecordFailure` (run-stage.ts) catches and
  * records the JSONL row. Schema-backed input validation (the two POST-prompt
  * checks) lives beside this in `input-validation.ts`.
  *
@@ -19,23 +19,19 @@ import {
 } from "../messages.js";
 import { readName } from "../stage-def.js";
 import type { RunContext } from "../types.js";
-import { StagePreflightError } from "./errors.js";
+import { haltPreflight, invariantPreflight } from "./errors.js";
 import type { ResolvedStage } from "./resolve-stage.js";
 
 /**
  * The skill-path preflight sequence, in its load-bearing order:
  *   1. ensureUpstreamArtifact   — halt: missing inherited artifact.
  *   2. ensureNamedReads         — halt: a `reads:` name has no published entry.
- *   3. enforceSessionInvariants — invariant: authoring-time-knowable throws
- *      (precede the registry check so the structural violation surfaces
- *      regardless of the runtime registry).
- *   4. ensureSkillRegistered    — halt: skill not registered in Pi.
+ *   3. ensureSkillRegistered    — halt: skill not registered in Pi.
  * (Input-schema validation runs after prompt prep — see input-validation.ts.)
  */
 export function runSingleStagePreflights(stage: ResolvedStage, run: RunContext): void {
 	ensureUpstreamArtifact(stage, run);
 	ensureNamedReads(stage, run);
-	enforceSessionInvariants(stage, run);
 	ensureSkillRegistered(stage, run);
 }
 
@@ -48,15 +44,14 @@ export function runSingleStagePreflights(stage: ResolvedStage, run: RunContext):
 export function ensureLoopNotContinue(stage: ResolvedStage): void {
 	if (stage.def.sessionPolicy !== "continue") return;
 	const reason =
-		`runStage: stage "${stage.name}" cannot combine loop with sessionPolicy "continue" — ` +
+		`dispatchStage: stage "${stage.name}" cannot combine loop with sessionPolicy "continue" — ` +
 		"each unit requires an isolated session";
-	throw new StagePreflightError("invariant", stage.name, MSG_STAGE_THREW(stage.name, reason), reason, false);
+	throw invariantPreflight(stage.name, MSG_STAGE_THREW(stage.name, reason), reason);
 }
 
 /**
- * Loop-stage preflights, run UNIFORMLY for every loop kind (the old
- * shortcuts bypassed them: a ≥1-unit fanout ran none; iterate ran none;
- * assess re-ran two inline):
+ * Loop-stage preflights, run UNIFORMLY for every loop kind — no kind takes a
+ * shortcut:
  *   - ensureNamedReads + ensureSkillRegistered for ALL loops (every loop's
  *     units dispatch `/skill:<skill>`, and generators read declared channels);
  *   - ensureUpstreamArtifact for ASSESS ONLY — the round-0 producer arg is
@@ -89,7 +84,7 @@ export function ensureJudgeSkillRegistered(judge: AnyJudge, stage: ResolvedStage
 		if (member.skill === undefined) continue;
 		if (run.registeredSkills.has(member.skill)) continue;
 		const f = FAIL_SKILL_NOT_REGISTERED(member.skill, stage.stageNumber);
-		throw new StagePreflightError("halt", member.skill, f.toast, f.error, true);
+		throw haltPreflight(member.skill, f);
 	}
 }
 
@@ -106,9 +101,8 @@ export function ensureJudgeSkillRegistered(judge: AnyJudge, stage: ResolvedStage
  * into a properly-attributed stage halt.
  *
  * Reads the snapshot in `run.registeredSkills` rather than calling
- * `host.getCommands()` mid-run, because Pi marks the `WorkflowHost` handle
- * stale on the first `ctx.newSession()` — the snapshot is built once in
- * `buildRunContext` before any session replaces the outer ctx.
+ * `host.getCommands()` mid-run — the snapshot is built once in
+ * `buildRunContext` at run start, off the launcher's registry-level host.
  *
  * Skipped for non-skill dispatch (a prompt stage sends raw text — there is
  * no skill to verify) and when `registeredSkills` is undefined (hostless
@@ -121,32 +115,35 @@ function ensureSkillRegistered(stage: ResolvedStage, run: RunContext): void {
 	if (run.registeredSkills.has(stage.skill)) return;
 
 	const f = FAIL_SKILL_NOT_REGISTERED(stage.skill, stage.stageNumber);
-	throw new StagePreflightError("halt", stage.skill, f.toast, f.error, true);
+	throw haltPreflight(stage.skill, f);
 }
 
 /**
  * The start node consumes the user's brief; subsequent stages MUST inherit
  * an upstream artifactPath. Falling back to originalInput past the start
  * would silently hand a downstream skill the raw feature description.
- *
- * Three opt-outs skip the check:
- *   - `inheritsArtifacts: false` (authored via `terminal()`) — stage consumes
- *     `originalInput` by design.
- *   - `reads: [...]` — stage builds its prompt from the named-publish
- *     registry instead of the rolling primary slot; `ensureNamedReads`
- *     enforces its own coverage rule.
- *   - prompt dispatch — the stage builds its own text and never consumes the
- *     rolling primary as an arg (a continue chat turn typically leans on
- *     session context, not a handle).
  */
+
+/** The start node consumes the user's brief; it has no upstream artifact to inherit. */
+const isStartStage = (stage: ResolvedStage, run: RunContext): boolean => stage.name === run.workflow.start;
+
+/** Authored via `terminal()`: the stage consumes `originalInput` by design. */
+const optsOutOfArtifactInheritance = (stage: ResolvedStage): boolean => stage.def.inheritsArtifacts === false;
+
+/** Builds its prompt from the named-publish registry, not the rolling primary slot. */
+const readsNamedChannels = (stage: ResolvedStage): boolean => !!stage.def.reads?.length;
+
+/** Prompt dispatch builds its own text and never takes the rolling primary as an arg. */
+const isPromptDispatch = (stage: ResolvedStage): boolean => stage.dispatch === "prompt";
+
 function ensureUpstreamArtifact(stage: ResolvedStage, run: RunContext): void {
-	if (stage.name === run.workflow.start) return;
-	if (stage.def.inheritsArtifacts === false) return;
-	if (stage.def.reads?.length) return;
-	if (stage.dispatch === "prompt") return;
+	if (isStartStage(stage, run)) return;
+	if (optsOutOfArtifactInheritance(stage)) return;
+	if (readsNamedChannels(stage)) return;
+	if (isPromptDispatch(stage)) return;
 	if (currentPrimaryArtifact(run.state)) return;
 	const f = FAIL_MISSING_ARTIFACT(stage.skill, stage.stageNumber);
-	throw new StagePreflightError("halt", stage.skill, f.toast, f.error, true);
+	throw haltPreflight(stage.skill, f);
 }
 
 /**
@@ -161,15 +158,12 @@ function ensureNamedReads(stage: ResolvedStage, run: RunContext): void {
 	if (!reads?.length) return;
 	for (const read of reads) {
 		const name = readName(read);
+		// Reads `.length` of a possibly PRE-SIZED produces-fanout channel as
+		// "satisfied". Safe by ordering: this runs at the READING stage's entry,
+		// AFTER the upstream fanout stage's fold completed its channel, so it never
+		// observes a half-filled produces-fanout channel.
 		if (run.state.named[name]?.length) continue;
 		const f = FAIL_MISSING_NAMED_READ(stage.skill, name, stage.stageNumber);
-		throw new StagePreflightError("halt", stage.skill, f.toast, f.error, true);
-	}
-}
-
-function enforceSessionInvariants(stage: ResolvedStage, run: RunContext): void {
-	if (stage.def.sessionPolicy === "continue" && !run.continueHost) {
-		const reason = `runStage: stage "${stage.name}" uses sessionPolicy "continue" but no workflow host was provided to runWorkflow`;
-		throw new StagePreflightError("invariant", stage.name, MSG_STAGE_THREW(stage.name, reason), reason, false);
+		throw haltPreflight(stage.skill, f);
 	}
 }

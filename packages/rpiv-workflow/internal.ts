@@ -33,7 +33,13 @@
 export { recordStage } from "./audit.js";
 export { __resetBuiltIns, flushBuiltInProviders, getBuiltIns } from "./built-ins.js";
 export { __resetLifecycleRegistry } from "./events.js";
+export { __resetWorkflowExecutionHost } from "./execution-host.js";
 export { __resetLoadCache } from "./load/cache.js";
+// Read-and-clear a gate's stop-pick note — test fixtures assert the reason a
+// bespoke `defineRoute` gate attached via `setRouteNote`; production consumption
+// stays inside the runner's routing audit.
+export { takeRouteNote } from "./routing-dsl.js";
+export { __resetStrikeBudgets } from "./sessions/bash-strikes.js";
 export {
 	__resetSkillContracts,
 	buildEffectiveContracts,

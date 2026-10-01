@@ -20,13 +20,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadWorkflows } from "./load/index.js";
 import { LEGACY_OVERLAY_NOTICE, LEGACY_RUNS_NOTICE } from "./load/legacy.js";
 import {
+	BACKWARD_JUMP_LIMIT_HEAD,
 	ERR_RESUME_LOOP_MISMATCH,
+	FAIL_BACKWARD_JUMP_EXHAUSTED,
 	FAIL_LOOP_CAP_HALT,
 	MSG_LOOP_CAP_ADVANCE,
 	MSG_LOOP_ZERO_UNITS,
 	MSG_RESUME_LOOP_MISMATCH,
-	MSG_UNIT_COMPLETE,
-	STATUS_LOOP_UNIT,
 } from "./messages.js";
 
 /** Extract the single backtick-delimited shell after `Move it:` from a notice. */
@@ -151,14 +151,6 @@ describe.skipIf(process.platform === "win32")("LEGACY_RUNS_NOTICE — embedded m
 });
 
 describe("unified loop message templates", () => {
-	it("STATUS_LOOP_UNIT renders the stage/skill/label status line", () => {
-		expect(STATUS_LOOP_UNIT(4, 7, "implement", "phase 2/5")).toBe("rpiv: stage 4/7 — implement (phase 2/5)");
-	});
-
-	it("MSG_UNIT_COMPLETE renders a labeled per-unit completion toast", () => {
-		expect(MSG_UNIT_COMPLETE("implement", "phase 2/5")).toBe("✓ implement (phase 2/5)");
-	});
-
 	it("MSG_LOOP_ZERO_UNITS warns the loop published nothing", () => {
 		expect(MSG_LOOP_ZERO_UNITS("blueprint")).toBe(
 			"rpiv: blueprint iterate loop produced zero units — nothing published, advancing",
@@ -185,5 +177,99 @@ describe("unified loop message templates", () => {
 		expect(MSG_RESUME_LOOP_MISMATCH("implement")).toBe(
 			'rpiv: loop "implement" changed on resume — cannot safely continue',
 		);
+	});
+});
+
+describe("FAIL_BACKWARD_JUMP_EXHAUSTED — BackwardJumpHaltInfo rendering", () => {
+	const capInfo = {
+		stage: "grade",
+		limitKind: "cap" as const,
+		count: 4,
+		max: 3,
+	};
+
+	it("BACKWARD_JUMP_LIMIT_HEAD is the exact case-sensitive head cap-halts.py greps", () => {
+		expect(BACKWARD_JUMP_LIMIT_HEAD).toBe("Backward-jump limit exceeded");
+	});
+
+	it("cap arm with an empty ring is byte-identical to the pre-progress text", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({ ...capInfo, progress: [] });
+		expect(f.error).toBe('Backward-jump limit exceeded: stage "grade" re-entered 4 times (max 3)');
+		expect(f.toast).toBe(
+			'rpiv: backward-jump limit exceeded — "grade" re-entered 4 times (max 3) — stopping workflow to prevent infinite loop',
+		);
+	});
+
+	it("cap-arm error retains the exact case-sensitive substring `Backward-jump limit` with a populated ring", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({ ...capInfo, progress: ["regressed"] });
+		expect(f.error).toContain("Backward-jump limit");
+		expect(f.error).toBe(
+			'Backward-jump limit exceeded: stage "grade" re-entered 4 times (max 3); last progress: regressed',
+		);
+	});
+
+	it("progress clause renders the ring in invocation order (oldest → newest)", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({
+			...capInfo,
+			count: 2,
+			max: 1,
+			progress: ["improved", "unknown", "regressed"],
+		});
+		expect(f.error).toContain("; last progress: improved, unknown, regressed");
+		// Both channels carry the clause.
+		expect(f.toast).toContain("; last progress: improved, unknown, regressed");
+	});
+
+	it("empty ring omits the clause entirely — no bare `last progress:` fragment", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({ ...capInfo, progress: [] });
+		expect(f.error).not.toContain("last progress");
+		expect(f.toast).not.toContain("last progress");
+	});
+});
+
+describe("FAIL_BACKWARD_JUMP_EXHAUSTED — ceiling arm (maxLaps)", () => {
+	it("empty ring renders the ceiling wording with the shared head, byte-exact on both channels", () => {
+		expect(
+			FAIL_BACKWARD_JUMP_EXHAUSTED({ stage: "a", limitKind: "ceiling", count: 9, max: 8, progress: [] }),
+		).toEqual({
+			toast: 'rpiv: backward-jump limit exceeded — "a" re-entered 9 times, over the absolute lap ceiling (max 8) — stopping workflow to prevent infinite loop',
+			error: 'Backward-jump limit exceeded: stage "a" re-entered 9 times, over the absolute lap ceiling (max 8)',
+		});
+	});
+
+	it("ceiling arm names the limit kind + the lap arithmetic", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({ stage: "a", limitKind: "ceiling", count: 3, max: 2, progress: [] });
+		expect(f.error).toContain("absolute lap ceiling");
+		expect(f.error).toMatch(/re-entered 3 times/);
+		expect(f.error).toMatch(/max 2/);
+		expect(f.error).toContain("Backward-jump limit exceeded");
+	});
+
+	it("ceiling arm appends the progress clause iff the ring is non-empty", () => {
+		const f = FAIL_BACKWARD_JUMP_EXHAUSTED({
+			stage: "a",
+			limitKind: "ceiling",
+			count: 9,
+			max: 8,
+			progress: ["improved", "improved", "improved"],
+		});
+
+		expect(f.error).toBe(
+			'Backward-jump limit exceeded: stage "a" re-entered 9 times, over the absolute lap ceiling (max 8); last progress: improved, improved, improved',
+		);
+		expect(f.toast).toContain("; last progress: improved, improved, improved");
+		const empty = FAIL_BACKWARD_JUMP_EXHAUSTED({ stage: "a", limitKind: "ceiling", count: 9, max: 8, progress: [] });
+		expect(empty.error).not.toContain("last progress");
+		expect(empty.toast).not.toContain("last progress");
+	});
+
+	it("cap arm stays byte-identical to the phase-1 rendering (convergence pin)", () => {
+		// The cap arm's rendering is phase 1's contract; phase 2 adds ONLY the
+		// ceiling wording. Pin the cap arm once more here so a phase-2 edit that
+		// accidentally touches the cap text fails this suite, not a run.
+		expect(FAIL_BACKWARD_JUMP_EXHAUSTED({ stage: "a", limitKind: "cap", count: 4, max: 3, progress: [] })).toEqual({
+			toast: 'rpiv: backward-jump limit exceeded — "a" re-entered 4 times (max 3) — stopping workflow to prevent infinite loop',
+			error: 'Backward-jump limit exceeded: stage "a" re-entered 4 times (max 3)',
+		});
 	});
 });

@@ -5,18 +5,20 @@
  * `resume-loop.ts` (which owns the loop-trailer arm's dispatch).
  */
 
+import type { Workflow } from "../api.js";
 import {
 	ERR_RESUME_MALFORMED_ROW,
 	ERR_RESUME_NO_ROWS,
 	ERR_RESUME_STAGE_GONE,
 	ERR_RESUME_VERSION_MISMATCH,
 } from "../messages.js";
+import { STOP } from "../routing-dsl.js";
 import { STATE_SCHEMA_VERSION } from "../state/index.js";
 import type { RunContext, WorkflowHostContext } from "../types.js";
 import { recordEntryThrow } from "./failure.js";
 import type { ReconstructResult } from "./resume.js";
 import { recordLoopDriftFailure, resumeLoopStage } from "./resume-loop.js";
-import { advance, buildLoopDeps, resumeStageWithSession, runStageOrRecordFailure } from "./run-stage.js";
+import { advance, buildLoopDeps, dispatchStageOrRecordFailure, resumeStageWithSession } from "./run-stage.js";
 
 /**
  * Pick the chain re-entry thunk from the trail trailer. Dispatch keys on the
@@ -25,10 +27,15 @@ import { advance, buildLoopDeps, resumeStageWithSession, runStageOrRecordFailure
  *     (zero dispatch; lifecycle bracketing identical to every other entry);
  *   - trailing unit row → re-enter the loop with the fold's cursor;
  *   - completed normal trailer → route onward (finished run hits stop ⇒ no-op);
+ *   - gate-stop halt on a side-effect stage → dispatch the gate's sole
+ *     non-stop target, or re-route (idempotent re-stop) when the target is
+ *     ambiguous — NEVER replay the arm (see the arm's comment);
  *   - failed/aborted trailer → session-backed rows try promotion/reattach
  *     (`resumeStageWithSession`); sessionless rows re-run cold (today's
  *     behavior). Dispatch keys on the STRUCTURED `session` field, mirroring
- *     the `parent !== undefined` arm.
+ *     the `parent !== undefined` arm. A gate-stop halt on a produces stage
+ *     lands here deliberately: its halt row is sessionless by construction
+ *     (`auditCtxFor`), so the gate stage re-runs cold — the re-measure.
  */
 export function selectResumeEntry(
 	ctx: WorkflowHostContext,
@@ -55,19 +62,71 @@ export function selectResumeEntry(
 				resumeLoopStage(ctx, recon.trailing!, idx, run, buildLoopDeps()),
 			);
 	}
+	if (recon.trailing && recon.trailing.parent === last.stage) {
+		// Open FANOUT generation whose trailer is its OWN parent-unset abort/halt
+		// stage row (a mid-flight abort). The fold keeps the generation open for
+		// exactly this case (see resume.ts), so `recon.trailing` carries the
+		// completed-unit slots — re-enter the loop to replay them and dispatch
+		// only the pending units (finding 7). Without this arm the aborted trailer
+		// falls through to the cold stage re-run below and re-dispatches EVERY
+		// unit, duplicating the channel and collapsing the downstream fan-in.
+		return () =>
+			guardResumeEntry(ctx, last.stage, run, () => resumeLoopStage(ctx, recon.trailing!, idx, run, buildLoopDeps()));
+	}
 	if (last.status === "completed") {
-		// route onward; finished run ⇒ hits stop ⇒ no-op
+		// c2 no-op path: a fully-completed run routes onward from its last stage,
+		// which hits `stop` ⇒ `finalizeWorkflow` ⇒ success. The walk runs the
+		// normal lifecycle bracket (onWorkflowStart/onWorkflowEnd) but dispatches
+		// no stage session — no stage re-run, no child spawned, zero new JSONL
+		// stage rows. This is the safe no-op behind resuming a finished run via
+		// @<runId>.
 		return () => guardResumeEntry(ctx, last.stage, run, () => advance(ctx, last.stage, idx, run));
 	}
-	// failed/aborted trailer — session-backed rows try promotion/reattach,
-	// sessionless rows re-run cold (today's behavior).
+	// Gate-stop halt off a SIDE-EFFECT stage: re-running the arm would replay
+	// its side effects against a tree the user has since hand-repaired — the
+	// observed livelock is a remediation arm that re-runs, changes nothing (the
+	// hand-fix already landed), and re-trips the very unchanged-tree gate that
+	// halted it. The re-measure path is the gate's own onward target: dispatch
+	// its sole non-stop target so the fix loop's verification body re-judges
+	// the repaired tree. A gate with several onward targets (none exist today)
+	// must NOT fall through to the cold re-dispatch below — that is exactly the
+	// replay this arm exists to prevent — so it re-routes instead: `advance`
+	// re-fires the edge over the replayed channels, which either picks a live
+	// onward branch or re-stops with the same note (an idempotent halt, zero
+	// side effects). Only a PRODUCES gate stage takes the re-dispatch below,
+	// where re-running IS the re-measure (fresh judgment, route re-folds).
+	if (recon.gateStop && run.workflow.stages[last.stage]?.kind === "side-effect") {
+		const onward = soleOnwardTarget(run.workflow, last.stage);
+		return onward !== undefined
+			? () => guardResumeEntry(ctx, onward, run, () => dispatchStageOrRecordFailure(ctx, onward, idx + 1, run))
+			: () => guardResumeEntry(ctx, last.stage, run, () => advance(ctx, last.stage, idx, run));
+	}
+	// failed/aborted trailer — the c2 boundary. Re-attempting this stage is
+	// intentional and the core resume retry use case: session-backed rows try
+	// promotion/reattach (`resumeStageWithSession`), sessionless rows re-run cold
+	// (today's behavior). Deliberately OUTSIDE c2's no-op guarantee — a new stage
+	// row IS appended and the stage re-runs (see the completed-vs-failed boundary
+	// tests in resume.test.ts).
 	return last.session !== null
 		? () => resumeStageWithSession(ctx, last, idx, run)
-		: () => runStageOrRecordFailure(ctx, last.stage, idx, run);
+		: () => dispatchStageOrRecordFailure(ctx, last.stage, idx, run);
 }
 
 /**
- * Resume-entry counterpart of `runStageOrRecordFailure`'s catch. The live
+ * The single non-stop target a decision edge can route onward to, or
+ * `undefined` when the edge declares none, several, or a target no longer in
+ * the workflow. Reads the `.targets` metadata every decision edge carries
+ * (`validate-workflow.ts` enforces it at load time), so no predicate is probed.
+ */
+function soleOnwardTarget(workflow: Workflow, stage: string): string | undefined {
+	const edge = workflow.edges[stage];
+	if (typeof edge !== "function" || !edge.targets) return undefined;
+	const onward = edge.targets.filter((t) => t !== STOP);
+	return onward.length === 1 && workflow.stages[onward[0]!] ? onward[0] : undefined;
+}
+
+/**
+ * Resume-entry counterpart of `dispatchStageOrRecordFailure`'s catch. The live
  * chain reaches user fns (loop `next`/`done`/`feedForward`, judge prompts,
  * route predicates) only under that catch; the resume-loop and route-onward
  * entry thunks call the same fns directly, so a throw would otherwise escape
@@ -75,7 +134,7 @@ export function selectResumeEntry(
  * caller loses the result envelope.
  */
 async function guardResumeEntry(
-	curCtx: WorkflowHostContext,
+	hostCtx: WorkflowHostContext,
 	name: string,
 	run: RunContext,
 	entry: () => Promise<unknown>,
@@ -83,7 +142,7 @@ async function guardResumeEntry(
 	try {
 		await entry();
 	} catch (e) {
-		await recordEntryThrow(curCtx, name, run, e);
+		await recordEntryThrow(hostCtx, name, run, e);
 	}
 }
 

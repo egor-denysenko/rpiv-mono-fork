@@ -216,14 +216,16 @@ describe("bundled skill contracts", () => {
 	// dropped, or fails to parse (a malformed block is silently skipped).
 	const declared = new Map(buildSkillContractsFromFrontmatter(BUNDLED_SKILLS_DIR));
 
-	it("declares a contract for the 20 pipeline + orthogonal skills", () => {
-		expect(declared.size).toBe(20);
+	it("declares a contract for the 31 pipeline + orthogonal skills", () => {
+		expect(declared.size).toBe(31);
 		for (const name of [
 			"discover",
 			"research",
+			"acceptance",
 			"explore",
 			"design",
 			"plan",
+			"quick-plan",
 			"blueprint",
 			"architecture-review",
 			"code-review",
@@ -239,6 +241,14 @@ describe("bundled skill contracts", () => {
 			"frontend-design",
 			"migrate-to-guidance",
 			"pr-triage",
+			"slice",
+			"design-slice",
+			"design-review",
+			"synthesize",
+			"elaborate",
+			"grade",
+			"amend",
+			"remediate",
 		]) {
 			expect(declared.has(name)).toBe(true);
 		}
@@ -260,10 +270,53 @@ describe("bundled skill contracts", () => {
 		expect(data?.properties?.phases).toBeDefined();
 	});
 
+	it("validate declares blockers as an optional array whose items require command + file", () => {
+		// The structured remediation handles the validate gate routes on and the
+		// scope floor's validate-report acceptance credits: optional (a pass or a
+		// fail covered by risk rulings omits it), but an entry that IS emitted must
+		// carry a runnable command + an attributable file for the acceptance to
+		// read (id/line are optional provenance).
+		const data = declared.get("validate")?.produces?.data as
+			| {
+					required?: string[];
+					properties?: {
+						blockers?: {
+							type?: string;
+							items?: { required?: string[]; properties?: Record<string, { type?: string }> };
+						};
+					};
+			  }
+			| undefined;
+		expect(data?.required).not.toContain("blockers");
+		const blockers = data?.properties?.blockers;
+		expect(blockers?.type).toBe("array");
+		expect(blockers?.items?.required).toEqual(["command", "file"]);
+		expect(blockers?.items?.properties?.id?.type).toBe("string");
+		expect(blockers?.items?.properties?.command?.type).toBe("string");
+		expect(blockers?.items?.properties?.file?.type).toBe("string");
+		expect(blockers?.items?.properties?.line?.type).toBe("number");
+	});
+
 	it("documents the declared-but-not-harvested orthogonal set", () => {
-		// These skills declare a contract but don't appear in any built-in workflow.
-		// The orthogonal set: 7 new + discover + explore + commit = 10 skills.
-		// (pr-triage IS harvested — it's dispatched by the pr-triage workflow.)
+		// These skills declare a contract but don't appear in any dispatched
+		// built-in workflow stage. The four built-ins (build/polish/vet/ship)
+		// never dispatch the pipeline-stage skills — discover/explore/research/
+		// design/plan/frontend-design are gated to explicit `/skill:` invocation
+		// and run as prompt-driven stages (e.g. `research: produces({ prompt: ... })`)
+		// or under a different skill (elaborate, synthesize, design-slice), so all
+		// six stay unharvested here — ship's research/validate run as prompt stages
+		// (harvest-skipped) while its `plan` dispatches quick-plan (harvested, so
+		// quick-plan is NOT on this list) and its `grade` reuses the already-harvested
+		// grade skill. Two more lost their only harvester when their workflows were
+		// removed:
+		//   - revise: was harvested only by the removed old-build graph's
+		//     `revise` stage; no restored workflow re-introduces it;
+		//   - pr-triage: was harvested only by the removed pr-triage workflow.
+		// commit stays listed too: acts({ outcome }) with no reads harvest-skips.
+		// Total: 6 doc/util (annotate-guidance/annotate-inline/changelog/
+		//        create-handoff/migrate-to-guidance/resume-handoff) + 6 pipeline
+		//        skills (discover/explore/research/design/plan/frontend-design) +
+		//        commit + pr-triage + revise = 15.
 		const harvested = harvestStageContracts(builtInWorkflows);
 		const notHarvested: string[] = [];
 		for (const [name] of declared) {
@@ -276,16 +329,21 @@ describe("bundled skill contracts", () => {
 				"changelog",
 				"commit",
 				"create-handoff",
+				"design",
 				"discover",
 				"explore",
 				"frontend-design",
 				"migrate-to-guidance",
+				"plan",
+				"pr-triage",
+				"research",
 				"resume-handoff",
+				"revise",
 			].sort(),
 		);
 	});
 
-	it("every declared kind matches the harvested kind for the six built-in workflows", () => {
+	it("every declared kind matches the harvested kind for the four built-in workflows", () => {
 		// Harvest derives each dispatched skill's kind from how the built-ins use
 		// it (produces() → "produces", acts() → "side-effect"). A declared kind
 		// that disagrees would make the rendered graph lie — catch it here.
@@ -328,7 +386,7 @@ describe("bundled skill contracts", () => {
 	});
 
 	it("plan's inline template (no templates/ dir) writes its required produces.data fields", () => {
-		const required = (declared.get("plan")?.produces?.data as { required?: string[] }).required!;
+		const required = (declared.get("plan")!.produces!.data as { required?: string[] }).required!;
 		const body = readFileSync(join(BUNDLED_SKILLS_DIR, "plan", "SKILL.md"), "utf-8");
 		// Scan for ---…--- frontmatter regions (robust to the ```! executable block
 		// at SKILL.md:46 that shifts naive fence-pair parity, and to nested fences
@@ -343,7 +401,7 @@ describe("bundled skill contracts", () => {
 	});
 
 	it("architecture-review template carries the required layer_count field", () => {
-		const required = (declared.get("architecture-review")?.produces?.data as { required?: string[] }).required!;
+		const required = (declared.get("architecture-review")!.produces!.data as { required?: string[] }).required!;
 		expect(required).toContain("layer_count");
 		const dir = join(BUNDLED_SKILLS_DIR, "architecture-review", "templates");
 		const text = readdirSync(dir)

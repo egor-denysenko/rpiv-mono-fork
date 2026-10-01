@@ -9,6 +9,7 @@ export type {
 	LoopCapRow,
 	NamesIndex,
 	RoutingDecision,
+	RunRecap,
 	RunSummary,
 	SessionRef,
 	StageStatus,
@@ -16,6 +17,7 @@ export type {
 	WorkflowStage,
 } from "./state.js";
 export {
+	appendHeader,
 	appendLoopCap,
 	appendRoutingDecision,
 	appendStage,
@@ -24,6 +26,7 @@ export {
 	isValidName,
 	listArtifacts,
 	listRuns,
+	MAX_NAME_LENGTH,
 	namesFilePath,
 	readAllStages,
 	readAllStagesForResume,
@@ -39,6 +42,6 @@ export {
 	runsDir,
 	STATE_SCHEMA_VERSION,
 	stateFilePath,
+	summarizeRun,
 	VALID_NAME,
-	writeHeader,
 } from "./state.js";

@@ -133,6 +133,7 @@ export interface LoopCapInfo {
  *   onLoopStart:     (stage, info)         => console.log(`  ⇉ ${stage.name} [${info.kind}]`),
  *   onUnitStart:     (stage, u)            => console.log(`     → ${u.label} (${u.role})`),
  *   onUnitEnd:       (stage, u)            => console.log(`     · ${stage.name} #${u.index}`),
+ *   onUnitHalt:      (stage, u, reason)    => console.warn(`     ✗ ${stage.name} #${u.index}: ${reason}`),
  *   onLoopCap:       (stage, c)            => console.warn(`  ⚠ ${stage.name} capped at ${c.max}`),
  *   onWorkflowEnd:   (result)              =>
  *     console.log(result.success ? "✓ done" : `✗ ${result.error ?? "halted"}`),
@@ -167,7 +168,10 @@ export interface LifecycleListeners {
 	/** After the stage's "failed"/"aborted" row lands in JSONL. Terminal for the run. */
 	onStageError?(stage: StageRef, error: string, ctx: LifecycleContext): void | Promise<void>;
 
-	/** After an `EdgeFn` picks and its routing-decision row lands. `to` may be the `STOP` sentinel literal `"stop"`. */
+	/**
+	 * After an `EdgeFn` picks and its routing-decision row lands. `to` may be the
+	 * `STOP` sentinel literal `"stop"`.
+	 */
 	onRoute?(from: StageRef, to: string, ctx: LifecycleContext): void | Promise<void>;
 
 	/** After `onStageStart`, before unit 1's session (after the unit list is computed for fanout). */
@@ -183,6 +187,18 @@ export interface LifecycleListeners {
 
 	/** Per unit, after the unit's JSONL row lands. Loop units never fire `onStageEnd`. */
 	onUnitEnd?(stage: StageRef, unit: UnitEvent, output: Output, ctx: LifecycleContext): void | Promise<void>;
+
+	/**
+	 * Per unit, after a collect-all fanout unit's NON-TERMINAL `collected:true`
+	 * failed row lands — the unit halted but the run survives (the synthesis fold
+	 * skips its sentinel slot). Fired ONLY on the soft-halt path; a fail-fast unit
+	 * fires `onStageError` (terminal) instead, and a successful unit fires
+	 * `onUnitEnd`. Distinct from both so a lane surface can flip the unit's sub-row
+	 * ✗ rather than leaving it to spin (then be swept ✓ at `onWorkflowEnd`).
+	 * `reason` is the halt cause — the same text the `collected:true` row's
+	 * `errMsg` carries.
+	 */
+	onUnitHalt?(stage: StageRef, unit: UnitEvent, reason: string, ctx: LifecycleContext): void | Promise<void>;
 
 	/** After an `onCap: "advance"` trip — fired after the `{type:"loop-cap"}` telemetry row append attempt. */
 	onLoopCap?(stage: StageRef, info: LoopCapInfo, ctx: LifecycleContext): void | Promise<void>;
@@ -304,8 +320,8 @@ export function buildLifecycleContext(args: {
  * structurally so this base-layer module never imports the runtime types).
  * Captured per fire so listeners always see the latest `state` snapshot.
  * THE one RunContext → LifecycleContext projection — the runner, the loop
- * driver, and the resume entries all share it (the old per-module clones
- * were kept aligned only by convention).
+ * driver, and the resume entries all share it; no per-module clones to keep
+ * aligned by convention.
  */
 export function lifecycleCtxFor(run: {
 	cwd: string;
@@ -326,7 +342,7 @@ export function lifecycleCtxFor(run: {
 }
 
 /**
- * Build a `LifecycleContext` from any SessionContext/AuditCtx-shaped object
+ * Build a `LifecycleContext` from any SessionContext/AuditContext-shaped object
  * (cwd + runId + the frozen `runIdentity` + live state). The session, audit,
  * and extraction layers all fire through this projection instead of
  * re-spelling the six-field literal.

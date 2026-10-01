@@ -11,6 +11,7 @@
  */
 
 import type { StandardSchemaV1 } from "@standard-schema/spec";
+import { requireNonEmptyString } from "./internal-utils.js";
 import type { AssessLoop, LoopDef, VerifySpec } from "./loop-def.js";
 import type { Output, RunView } from "./output.js";
 import type { Outcome } from "./output-spec.js";
@@ -59,9 +60,27 @@ export const STAGE_KINDS = ["produces", "side-effect"] as const;
 export type StageKind = (typeof STAGE_KINDS)[number];
 
 /**
- * - `"fresh"` — wraps the stage in `ctx.newSession({ withSession })`.
- * - `"continue"` — reuses the prior session via `host.sendUserMessage()` +
- *   `ctx.waitForIdle()`; branch sliced by `branchOffset`.
+ * The backward-jump guard's progress verdicts — what a stage's optional
+ * `progress` hook returns per decision-edge re-entry (see `StageDefBase.progress`).
+ * `"improved"` WAIVES the re-entry (the per-destination budget is untouched;
+ * the chain re-dispatches the stage); `"unchanged"` / `"regressed"` /
+ * `"unknown"` COUNT exactly as a hook-less re-entry does. The `as const`
+ * array is the single source of truth (same idiom as `STAGE_KINDS`): the
+ * literal-union type is derived from it, and the guard normalizes any
+ * off-union return (a jiti-loaded literal erased the union) to `"unknown"`
+ * via one membership check against the same array.
+ */
+export const PROGRESS_VALUES = ["improved", "unchanged", "regressed", "unknown"] as const;
+export type ProgressValue = (typeof PROGRESS_VALUES)[number];
+
+/**
+ * - `"fresh"` — the stage runs in a brand-new detached child session.
+ * - `"continue"` — the stage FORKS its predecessor's persisted child session
+ *   (`SessionManager.forkFrom`), so the child carries the prior conversation as
+ *   context; the continuation turn is then sent into it, and its outcome is
+ *   sliced past the inherited prefix by a `branchOffset` re-derived from the
+ *   forked branch. No predecessor session (start stage / after a loop / file
+ *   gone) degrades to a fresh dispatch.
  */
 export const SESSION_POLICIES = ["fresh", "continue"] as const;
 export type SessionPolicy = (typeof SESSION_POLICIES)[number];
@@ -163,9 +182,7 @@ export type StageRead = string | { readonly name: string; readonly all?: boolean
  * (produces()/acts()/terminal()), which apply defaults without validating.
  */
 export function fanin(name: string): { readonly name: string; readonly all: true } {
-	if (typeof name !== "string" || name.length === 0) {
-		throw new Error("fanin(name): name must be a non-empty channel name");
-	}
+	requireNonEmptyString(name, "fanin(name)", "name must be a non-empty channel name");
 	return { name, all: true };
 }
 
@@ -180,7 +197,7 @@ export function readsAll(read: StageRead): boolean {
 }
 
 // ===========================================================================
-// StageDef — the discriminated union over the dispatch axis (T1)
+// StageDef — the discriminated union over the dispatch axis
 // ===========================================================================
 
 /**
@@ -223,6 +240,27 @@ interface StageDefBase<TIn = unknown, TOut = unknown> {
 	 * own outcome) — `validateWorkflow` warns when set there.
 	 */
 	inheritsArtifacts?: boolean;
+	/**
+	 * Optional backward-jump progress hook, consulted ONLY when a decision
+	 * edge re-enters this stage (never on first visit). The guard awaits
+	 * `(state) => "improved" | "unchanged" | "regressed" | "unknown"` (sync or
+	 * async) and:
+	 *
+	 *   - `"improved"` — WAIVES the re-entry: no budget consumed, the chain
+	 *     re-dispatches this stage exactly as a counted re-entry under the
+	 *     cap would;
+	 *   - anything else — the re-entry COUNTS against the per-destination
+	 *     cap, exactly as a hook-less stage's re-entry does today.
+	 *
+	 * The hook is an observation, never a halt surface: a throwing hook
+	 * degrades to `"unknown"` (counts, never halts by itself); an off-union
+	 * return normalizes to `"unknown"`; an absent hook means every re-entry
+	 * counts. Declared on the base so all three dispatch arms (skill /
+	 * script / prompt) carry it; composes with `loop` / `verify` / `reads`
+	 * (no exclusion rules — a function-valued hook is the only shape rule,
+	 * enforced at load as `progress-not-function`).
+	 */
+	progress?: (state: RunView) => ProgressValue | Promise<ProgressValue>;
 }
 
 /**
@@ -349,7 +387,7 @@ export interface PromptStage<TIn = unknown, TOut = unknown> extends StageDefBase
 
 /**
  * A stage in the workflow graph — a discriminated union over the DISPATCH
- * axis (T1): skill (`SkillStage`, the default), script (`ScriptStage`,
+ * axis: skill (`SkillStage`, the default), script (`ScriptStage`,
  * `run` present), or raw prompt (`PromptStage`, `prompt` present). The
  * stage's identity is the surrounding `Workflow.stages` record key.
  *
@@ -359,7 +397,7 @@ export interface PromptStage<TIn = unknown, TOut = unknown> extends StageDefBase
  * hand-rolled literals because jiti erases TS types (same posture as the
  * `Judge` union + `judgeShapeIssues`).
  *
- * TYPING MODEL (T2): `<TIn, TOut>` are LOCAL inference helpers — they tie a
+ * TYPING MODEL: `<TIn, TOut>` are LOCAL inference helpers — they tie a
  * factory call's `inputSchema`/`outputSchema`/`run` together, then erase at
  * the `Workflow.stages` boundary (`Record<string, StageDef>`). They do NOT
  * carry types across edges; inter-stage typing is runtime-contract-based
@@ -395,7 +433,7 @@ export function defineWorkflow(spec: Workflow): Workflow {
 }
 
 /**
- * Builder options are PROJECTIONS of the union arms (T13): each interface
+ * Builder options are PROJECTIONS of the union arms: each interface
  * `Pick`s its fields from the arm the factory constructs, and the factory
  * spreads the options over the arm's fixed fields. Adding a knob to an arm
  * is one edit here (extend the `Pick` key list — a stale key no longer on
@@ -412,7 +450,14 @@ export function defineWorkflow(spec: Workflow): Workflow {
 interface ProducesScriptOptions<TIn = unknown, TOut = unknown>
 	extends Pick<
 		ScriptStage<TIn, TOut>,
-		"outputSchema" | "inputSchema" | "onInvalid" | "maxRetries" | "validateTimeoutMs" | "inheritsArtifacts" | "reads"
+		| "outputSchema"
+		| "inputSchema"
+		| "onInvalid"
+		| "maxRetries"
+		| "validateTimeoutMs"
+		| "inheritsArtifacts"
+		| "reads"
+		| "progress"
 	> {
 	run: ProducesScriptFn<string, TOut>;
 }
@@ -424,7 +469,7 @@ interface ProducesScriptOptions<TIn = unknown, TOut = unknown>
  * (they emit no data envelope), so the retry knobs don't apply.
  */
 interface ActsScriptOptions<TIn = unknown>
-	extends Pick<ScriptStage<TIn, void>, "inputSchema" | "inheritsArtifacts" | "reads"> {
+	extends Pick<ScriptStage<TIn, void>, "inputSchema" | "inheritsArtifacts" | "reads" | "progress"> {
 	run: ActsScriptFn;
 }
 
@@ -438,7 +483,15 @@ interface ActsScriptOptions<TIn = unknown>
 interface ProducesPromptOptions<TIn = unknown, TOut = unknown>
 	extends Pick<
 		PromptStage<TIn, TOut>,
-		"prompt" | "outputSchema" | "inputSchema" | "onInvalid" | "maxRetries" | "validateTimeoutMs" | "loop" | "verify"
+		| "prompt"
+		| "outputSchema"
+		| "inputSchema"
+		| "onInvalid"
+		| "maxRetries"
+		| "validateTimeoutMs"
+		| "loop"
+		| "verify"
+		| "progress"
 	> {
 	outcome: Outcome;
 	/** `"continue"` makes this a follow-up turn on a session a prior stage populated. */
@@ -451,66 +504,75 @@ interface ProducesPromptOptions<TIn = unknown, TOut = unknown>
  * variant: no `outcome` (nothing collected). For a collecting side-effect
  * prompt stage, use the bare `acts({ prompt, outcome })` field form instead.
  */
-interface ActsPromptOptions<TIn = unknown> extends Pick<PromptStage<TIn, void>, "prompt" | "inputSchema"> {
+interface ActsPromptOptions<TIn = unknown> extends Pick<PromptStage<TIn, void>, "prompt" | "inputSchema" | "progress"> {
 	/** `"continue"` makes this a follow-up turn on a session a prior stage populated. */
 	sessionPolicy?: SessionPolicy;
 }
 
+/**
+ * THE stage-defaults authority — owns the load-bearing `as StageDef<TIn, TOut>`
+ * cast (a `Partial<StageDef>` union can't be proven to complete a single arm,
+ * so the cast is required for the `Partial`-override factories; taming it here
+ * means callers don't repeat the concession) + the shared
+ * `{ kind, sessionPolicy, ...overrides }` body. Genericized to `<TIn, TOut>` so
+ * the four typed factories (`producesScript`/`producesPrompt`/`actsPrompt`/
+ * `actsScript`) route through it without widening against their
+ * `StageDef<TIn, TOut>` / `StageDef<TIn, void>` return annotations; the two
+ * `Partial`-override factories `producesFn`/`actsFn` call it with the default
+ * `<unknown, unknown>` params. `overrides.sessionPolicy ?? "fresh"` honors the
+ * `"continue"` override the two prompt factories expose (the trailing
+ * `...overrides` spread makes a present `sessionPolicy` win regardless). The
+ * cast's load-bearingness is documented ONCE here, not on each twin.
+ */
+function withDefaults<TIn = unknown, TOut = unknown>(
+	kind: "produces" | "side-effect",
+	overrides: Partial<StageDef<TIn, TOut>> & { sessionPolicy?: SessionPolicy } = {},
+): StageDef<TIn, TOut> {
+	return { kind, sessionPolicy: overrides.sessionPolicy ?? "fresh", ...overrides } as StageDef<TIn, TOut>;
+}
+
 function producesFn(overrides: Partial<StageDef> = {}): StageDef {
-	// The cast is the factory's one concession: a `Partial` of a union can't be
-	// proven to complete a single arm. Call sites stay arm-checked (an object
-	// literal mixing dispatches fails before it reaches the spread).
-	return {
-		kind: "produces",
-		sessionPolicy: "fresh",
-		...overrides,
-	} as StageDef;
+	return withDefaults("produces", overrides);
 }
 
 function producesScript<TIn = unknown, TOut = unknown>(opts: ProducesScriptOptions<TIn, TOut>): StageDef<TIn, TOut> {
-	return {
-		kind: "produces",
-		sessionPolicy: "fresh",
-		...opts,
-	};
+	return withDefaults<TIn, TOut>("produces", opts);
 }
 
 function producesPrompt<TIn = unknown, TOut = unknown>(opts: ProducesPromptOptions<TIn, TOut>): StageDef<TIn, TOut> {
-	return {
-		kind: "produces",
-		...opts,
-		sessionPolicy: opts.sessionPolicy ?? "fresh",
-	};
+	return withDefaults<TIn, TOut>("produces", opts);
 }
 
 function actsFn(overrides: Partial<StageDef> = {}): StageDef {
-	return {
-		kind: "side-effect",
-		sessionPolicy: "fresh",
-		...overrides,
-	} as StageDef;
+	return withDefaults("side-effect", overrides);
 }
 
 function actsPrompt<TIn = unknown>(opts: ActsPromptOptions<TIn>): StageDef<TIn, void> {
-	return {
-		kind: "side-effect",
-		...opts,
-		sessionPolicy: opts.sessionPolicy ?? "fresh",
-	};
+	return withDefaults<TIn, void>("side-effect", opts);
 }
 
 function actsScript<TIn = unknown>(opts: ActsScriptOptions<TIn>): StageDef<TIn, void> {
-	return {
-		kind: "side-effect",
-		sessionPolicy: "fresh",
-		...opts,
-	};
+	return withDefaults<TIn, void>("side-effect", opts);
 }
 
+// A terminal stage = side-effect + inheritsArtifacts: false (see the `terminal()`
+// public doc). `terminalFn` (Partial path) and `terminalScript` (concrete-opts
+// path below) are the two realizations; both set the same marker.
+//
+// "terminal" SENSE 1 (the factory — this fn + the `terminal` export below): a
+// side-effect stage that does NOT inherit the upstream artifact. Distinct from
+// SENSE 2 (graph sink — `StageShape.edge.mode: "terminal"` in loop-constructors.ts
+// / `{ kind: "stop" }` in routing.ts: no outgoing edge OR explicit `STOP`;
+// orthogonal to this factory — a `terminal()` stage can route onward, and a
+// plain stage can be a sink) and SENSE 3 (run-outcome prose — "terminal
+// failure/outcome" = a halt that ends the run, e.g. audit.ts `recordFailureRow`).
+// See the `terminal` export doc below for the full glossary.
 function terminalFn(overrides: Partial<StageDef> = {}): StageDef {
-	return actsFn({ ...overrides, inheritsArtifacts: false } as Partial<StageDef>);
+	return withDefaults("side-effect", { ...overrides, inheritsArtifacts: false });
 }
 
+// Concrete-opts twin of `terminalFn` above — both realize "side-effect +
+// inheritsArtifacts: false" via their respective paths (script vs Partial).
 function terminalScript<TIn = unknown>(opts: ActsScriptOptions<TIn>): StageDef<TIn, void> {
 	return actsScript({ ...opts, inheritsArtifacts: false });
 }
@@ -565,5 +627,19 @@ export const acts = Object.assign(actsFn, { script: actsScript, prompt: actsProm
  * Desugars to `acts({ ...overrides, inheritsArtifacts: false })`. The
  * skillless variant `terminal.script({ run, ... })` desugars to
  * `acts.script({ ...opts, inheritsArtifacts: false })`.
+ *
+ * ── Glossary: "terminal" has three unrelated senses in this package ──
+ *  1. FACTORY (this export, `terminalFn`/`terminalScript`): a side-effect
+ *     stage that does NOT inherit the upstream artifact (`inheritsArtifacts:
+ *     false`). A `terminal()` stage may still carry a downstream edge.
+ *  2. GRAPH SINK (`StageShape.edge.mode: "terminal"` in loop-constructors.ts;
+ *     `{ kind: "stop" }` in routing.ts `RoutingResult`; rendered "(terminal)"
+ *     by preview.ts `formatEdge`; "implicit terminals" in validate/graph.ts):
+ *     a stage with NO outgoing edge OR an explicit `STOP`. Orthogonal to the
+ *     factory — a `terminal()` stage can route onward, a plain stage can be a
+ *     sink.
+ *  3. RUN OUTCOME ("terminal failure/outcome" prose, e.g. audit.ts
+ *     `recordFailureRow` / `recordFatalFailure`): a failure/cancellation/
+ *     abort that ends the run.
  */
 export const terminal = Object.assign(terminalFn, { script: terminalScript });

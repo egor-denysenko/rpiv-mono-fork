@@ -1,11 +1,11 @@
 /**
- * C7 regression: a failed run-header append refuses the run start. A lost
+ * A failed run-header append refuses the run start. A lost
  * header makes the run unlistable and unresumable while its stage rows land,
  * and the name claim has already burned the name — so `runWorkflow` must
  * reject BEFORE any stage executes and roll the claim back.
  *
  * Lives in its own file because `vi.mock` is module-scoped: every test here
- * runs with `writeHeader` forced to fail.
+ * runs with `appendHeader` forced to fail.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -19,7 +19,7 @@ import { runWorkflow } from "./runner.js";
 
 vi.mock("../state/writes.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../state/writes.js")>();
-	return { ...actual, writeHeader: vi.fn(() => false) };
+	return { ...actual, appendHeader: vi.fn(() => false) };
 });
 
 const tinyWorkflow: Workflow = {
@@ -39,7 +39,7 @@ afterEach(() => {
 	rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("runWorkflow — header write failure (C7)", () => {
+describe("runWorkflow — header write failure", () => {
 	it("refuses the run start with no runId and zero stages executed", async () => {
 		const chain = createMockSessionChain({ cwd: tmpDir, steps: [] });
 		const result = await runWorkflow(chain.ctx, { workflow: tinyWorkflow, input: "x" });
@@ -57,7 +57,7 @@ describe("runWorkflow — header write failure (C7)", () => {
 
 		expect(result.success).toBe(false);
 		expect(result.error).toMatch(/could not write the run header/);
-		// claimName persisted the entry before writeHeader ran; the refusal
+		// claimName persisted the entry before appendHeader ran; the refusal
 		// must have released it.
 		expect(readNamesIndex(tmpDir) ?? {}).toEqual({});
 	});

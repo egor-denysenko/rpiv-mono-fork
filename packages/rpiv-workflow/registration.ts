@@ -35,7 +35,9 @@ export {
 	match,
 	ON_INVALID_VALUES,
 	type OnInvalid,
+	PROGRESS_VALUES,
 	type ProducesScriptFn,
+	type ProgressValue,
 	type PromptFn,
 	type PromptStage,
 	produces,
@@ -52,6 +54,7 @@ export {
 	type StageKind,
 	type StageRead,
 	type StageSchema,
+	setRouteNote,
 	terminal,
 	type Unit,
 	type UnitRole,
@@ -82,7 +85,12 @@ export {
 	opaque,
 	url,
 } from "./handle.js";
-export type { WorkflowHost, WorkflowHostContext, WorkflowSessionContext } from "./host.js";
+export type {
+	ModelSelection,
+	WorkflowHost,
+	WorkflowHostContext,
+	WorkflowSessionContext,
+} from "./host.js";
 // Only the contract data types are public — they're referenced by kept public
 // signatures (`JsonSchemaCapable` ← `typeboxSchema`, `JsonSchemaObject` ←
 // `ConsumesSpec`/`ProducesSpec.data`, `SchemaCompatResult` ← `canCompose`). The
@@ -165,15 +173,15 @@ export type { Output, OutputMeta, RunView, Verdict } from "./output.js";
 export {
 	type ArtifactCollector,
 	type ArtifactParser,
-	type CollectCtx,
+	type CollectContext,
 	type CollectResult,
 	defineCollector,
 	defineParser,
 	type Outcome,
 	type OutputSpec,
-	type ParseCtx,
+	type ParseContext,
 	type ParseResult,
-	type SnapshotCtx,
+	type SnapshotContext,
 } from "./output-spec.js";
 export { eq, gt, gte, lt, lte, type NumericPredicate, type Predicate } from "./predicates.js";
 export type {
@@ -200,6 +208,7 @@ export {
 	type LoopCapRow,
 	listArtifacts,
 	listRuns,
+	type RunRecap,
 	type RunSummary,
 	readHeader,
 	readLastStage,
@@ -211,14 +220,20 @@ export {
 	runFileFor,
 	type SessionRef,
 	STATE_SCHEMA_VERSION,
+	summarizeRun,
 	type WorkflowHeader,
 	type WorkflowStage,
 } from "./state/index.js";
+// The persisted-session branch shape the host-injected `readSessionBranch`
+// reader returns (`WorkflowExecutionProvider.readSessionBranch` /
+// `RunContext.readSessionBranch`). Re-exported so the rpiv-pi host can name the
+// return type when it narrows `SessionManager.open(file).getBranch()`.
+export type { BranchEntry } from "./transcript.js";
 export { DEFAULT_TRIGGER, type RunTrigger } from "./triggers.js";
 export { typeboxSchema } from "./typebox-adapter.js";
-// `RunState` is deliberately NOT here — it became runner-private when user
-// contexts switched to the deep-readonly `RunView` (T3). Test fixtures that
-// must construct one import it from `@juicesharp/rpiv-workflow/internal`.
+// `RunState` is deliberately NOT here — it is runner-private; user contexts
+// use the deep-readonly `RunView`. Test fixtures that must construct one
+// import it from `@juicesharp/rpiv-workflow/internal`.
 export type { RunTermination } from "./types.js";
 export { type SchemaValidationFailure, validateOutputData } from "./validate-output.js";
 export {

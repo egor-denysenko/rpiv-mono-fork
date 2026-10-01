@@ -2,18 +2,14 @@
  * Session lifecycle wiring for rpiv-core.
  *
  * Each handler body is a named helper; pi.on(...) lines are pure wiring.
- * Ordering and invariants preserved verbatim from the pre-refactor index.ts.
+ * Handler order is deliberate — preserve it.
  */
 
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
 import {
-	type AgentEndEvent,
 	type BeforeAgentStartEvent,
 	type ExtensionAPI,
 	type ExtensionContext,
 	isToolCallEventType,
-	parseSkillBlock,
 	type ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -24,16 +20,17 @@ import {
 	syncBundledAgents,
 } from "./agents.js";
 import { renderBanner } from "./banner.js";
-import { FLAG_DEBUG, MSG_TYPE_GIT_CONTEXT } from "./constants.js";
+import { FLAG_DEBUG, MSG_TYPE_GIT_CONTEXT, MSG_TYPE_POST_COMPACT_CONTEXT } from "./constants.js";
 import {
 	clearGitContextCache,
 	isGitMutatingCommand,
+	refreshGitContextForInjection,
 	resetInjectedMarker,
 	takeGitContextIfChanged,
 } from "./git-context.js";
-import { ARTIFACTS_SUBDIR, clearInjectionState, handleToolCallGuidance, injectRootGuidance } from "./guidance.js";
+import { clearInjectionState, handleToolCallGuidance, injectRootGuidance, takeRootGuidance } from "./guidance.js";
 import { findMissingSiblings } from "./package-checks.js";
-import { BUNDLED_SKILL_NAMES } from "./paths.js";
+import { injectPipelinePointer, PIPELINE_POINTER } from "./pipeline-pointer.js";
 import { isStaleCtxError } from "./utils.js";
 
 /**
@@ -50,9 +47,17 @@ import { isStaleCtxError } from "./utils.js";
  */
 let startupMaintenanceDone = false;
 
+/**
+ * Sessions whose compacted-away RPIV context must be restored on their next
+ * real user turn. Keying by SessionManager identity prevents a detached child
+ * compaction from arming the root launcher (or another concurrent child).
+ */
+let postCompactSessions = new WeakSet<object>();
+
 /** Test reset — wired into test/setup.ts `beforeEach`. */
 export function __resetSessionHooksAnnounced(): void {
 	startupMaintenanceDone = false;
+	postCompactSessions = new WeakSet<object>();
 }
 
 const msgAgentsAdded = (n: number) => `Copied ${n} rpiv-pi agent(s) to ~/.pi/agent/agents/`;
@@ -81,6 +86,20 @@ function buildGitContextMessage(pi: ExtensionAPI, content: string) {
 	return { customType: MSG_TYPE_GIT_CONTEXT, content, display: !!pi.getFlag(FLAG_DEBUG) };
 }
 
+function buildPostCompactContextMessage(pi: ExtensionAPI, rootGuidance: string | null, gitContext: string | null) {
+	const parts = [
+		"[rpiv post-compaction context — reference material, NOT a task. Do not acknowledge this block. Answer the user's current request; when it says to continue, resume from the compaction summary and authoritative artifacts.]",
+		PIPELINE_POINTER,
+		rootGuidance,
+		gitContext,
+	].filter((part): part is string => part !== null);
+	return {
+		customType: MSG_TYPE_POST_COMPACT_CONTEXT,
+		content: parts.join("\n\n---\n\n"),
+		display: !!pi.getFlag(FLAG_DEBUG),
+	};
+}
+
 function sendGitContextMessage(pi: ExtensionAPI, content: string) {
 	pi.sendMessage(buildGitContextMessage(pi, content));
 }
@@ -91,11 +110,10 @@ function sendGitContextMessage(pi: ExtensionAPI, content: string) {
 
 export function registerSessionHooks(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => onSessionStart(_event, ctx, pi));
-	pi.on("session_compact", async (_event, ctx) => onSessionCompact(_event, ctx, pi));
+	pi.on("session_compact", async (_event, ctx) => onSessionCompact(_event, ctx));
 	pi.on("session_shutdown", async () => onSessionShutdown());
 	pi.on("tool_call", async (event, ctx) => onToolCall(event, ctx, pi));
 	pi.on("before_agent_start", async (event, ctx) => onBeforeAgentStart(event, ctx, pi));
-	pi.on("agent_end", async (_event, ctx) => onAgentEnd(_event, ctx));
 }
 
 // ---------------------------------------------------------------------------
@@ -104,12 +122,13 @@ export function registerSessionHooks(pi: ExtensionAPI): void {
 
 async function onSessionStart(
 	_event: unknown,
-	ctx: { cwd: string; hasUI: boolean; ui: UI },
+	ctx: { cwd: string; hasUI: boolean; ui: UI; sessionManager: object },
 	pi: ExtensionAPI,
 ): Promise<void> {
+	postCompactSessions.delete(ctx.sessionManager);
 	resetInjectionState();
 	injectRootGuidance(ctx.cwd, pi);
-	migrateThoughtsToArtifacts(ctx.cwd);
+	injectPipelinePointer(pi);
 	await injectGitContext(pi, (msg) => sendGitContextMessage(pi, msg));
 
 	// Injections above run every fire (each stage needs its own guidance + git
@@ -129,21 +148,23 @@ async function onSessionStart(
 	}
 }
 
-async function onSessionCompact(_event: unknown, ctx: { cwd: string }, pi: ExtensionAPI): Promise<void> {
+async function onSessionCompact(_event: unknown, ctx: { sessionManager: object }): Promise<void> {
 	resetInjectionState();
 	clearGitContextCache();
 	resetInjectedMarker();
-	// Auto-compaction races session disposal: pi-core's AgentSession.dispose()
-	// invalidates the extension runner while _runAutoCompaction is still emitting
-	// session_compact, so both `ctx` and `pi` become dead proxies whose
-	// getters/methods throw the stale error. Guessing a cwd buys nothing — the
-	// very next pi.sendMessage throws the same way — and the compacting session
-	// is being discarded anyway: the replacement session's session_start re-runs
-	// all of this. So on a stale ctx, bail. Any other error is a real bug in
-	// guidance/git injection and must propagate.
+	// NEVER call pi.sendMessage here. Auto-compaction runs before overflow retry
+	// settles, so injected messages become steering queue items. With Pi's default
+	// one-at-a-time delivery each item can consume its own assistant turn and
+	// displace the interrupted task. Mark this exact session instead; its next
+	// user-authored turn receives one merged context block from before_agent_start.
+	// Overflow retry itself proceeds from the compaction summary with no synthetic
+	// last message competing for the model's attention.
+	//
+	// Auto-compaction can also race session disposal. In that path ctx is a stale
+	// proxy and the replacement session's session_start performs normal injection,
+	// so swallowing only the canonical stale error remains correct.
 	try {
-		injectRootGuidance(ctx.cwd, pi);
-		await injectGitContext(pi, (msg) => sendGitContextMessage(pi, msg));
+		postCompactSessions.add(ctx.sessionManager);
 	} catch (e) {
 		if (!isStaleCtxError(e)) throw e;
 	}
@@ -167,78 +188,35 @@ async function onToolCall(event: ToolCallEvent, ctx: ExtensionContext, pi: Exten
 	}
 }
 
-// Runs every fire — `rpiv: <skill>` is a per-stage display string (each
-// stage owns the status line during its run), and the git-context injection
-// is keyed off `takeGitContextIfChanged` which is its own dedup layer.
+// Runs every fire — the git-context injection is keyed off
+// `takeGitContextIfChanged` which is its own dedup layer.
 async function onBeforeAgentStart(
-	event: BeforeAgentStartEvent,
+	_event: BeforeAgentStartEvent,
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
-): Promise<{ message: ReturnType<typeof buildGitContextMessage> } | undefined> {
-	const parsed = parseSkillBlock(event.prompt);
-	if (parsed && isOwnedSkill(parsed.name)) ctx.ui.setStatus("rpiv-skill", `rpiv: ${parsed.name}`);
+): Promise<
+	| { message: ReturnType<typeof buildGitContextMessage> }
+	| { message: ReturnType<typeof buildPostCompactContextMessage> }
+	| undefined
+> {
+	if (postCompactSessions.has(ctx.sessionManager)) {
+		postCompactSessions.delete(ctx.sessionManager);
+		const rootGuidance = takeRootGuidance(ctx.cwd, "restored on the first user turn after compaction", true);
+		const gitContext = await refreshGitContextForInjection(pi);
+		return { message: buildPostCompactContextMessage(pi, rootGuidance, gitContext) };
+	}
+
 	const content = await takeGitContextIfChanged(pi);
 	if (!content) return undefined;
 	return { message: buildGitContextMessage(pi, content) };
-}
-
-async function onAgentEnd(_event: AgentEndEvent, ctx: ExtensionContext): Promise<void> {
-	ctx.ui.setStatus("rpiv-skill", undefined);
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Allowlist of rpiv-pi's own skill names, sourced from the shared
-// `BUNDLED_SKILL_NAMES` constant. Prevents the status bar from claiming
-// `rpiv:` ownership of user-supplied or third-party skills. The set is
-// computed once at module load in paths.ts.
-function isOwnedSkill(name: string): boolean {
-	return BUNDLED_SKILL_NAMES.has(name);
-}
-
 function resetInjectionState(): void {
 	clearInjectionState();
-}
-
-function migrateThoughtsToArtifacts(cwd: string): void {
-	const oldShared = join(cwd, "thoughts", "shared");
-	if (!existsSync(oldShared)) return;
-
-	try {
-		const entries = readdirSync(oldShared, { withFileTypes: true });
-		if (entries.length === 0) return; // empty source — nothing to copy, leave on disk
-
-		const newArtifacts = join(cwd, ".rpiv", ARTIFACTS_SUBDIR);
-		mkdirSync(newArtifacts, { recursive: true });
-
-		for (const entry of entries) {
-			const src = join(oldShared, entry.name);
-			const dest = join(newArtifacts, entry.name);
-			cpSync(src, dest, { recursive: true, errorOnExist: false, force: true });
-			if (!existsSync(dest)) {
-				console.warn(`[rpiv-pi] migration: failed to copy ${src} → ${dest}`);
-				return; // abort — don't delete source if copy failed
-			}
-		}
-
-		// All copies verified — safe to remove source
-		rmSync(oldShared, { recursive: true, force: true });
-
-		// Remove thoughts/ root only if empty (preserves thoughts/me/ etc.)
-		const thoughtsRoot = join(cwd, "thoughts");
-		try {
-			if (readdirSync(thoughtsRoot).length === 0) {
-				rmSync(thoughtsRoot, { recursive: true, force: true });
-			}
-		} catch {
-			// thoughts/ already gone or unreadable — not an error
-		}
-	} catch (e) {
-		console.warn(`[rpiv-pi] migration: ${e instanceof Error ? e.message : String(e)}`);
-		// Never crash session_start — migration is best-effort
-	}
 }
 
 async function injectGitContext(pi: ExtensionAPI, send: (msg: string) => void): Promise<void> {

@@ -5,7 +5,7 @@
  *
  * Internal module — not re-exported from registration.ts. The runner reserves
  * names through `claimName` (the single in-process door: validate →
- * collision-check → persist) BEFORE `writeHeader`. External consumers resolve
+ * collision-check → persist) BEFORE `appendHeader`. External consumers resolve
  * names through `resolveRun`.
  *
  * Durability: every write goes through `writeNamesIndex` — temp file +
@@ -43,8 +43,11 @@ export type ClaimResult =
 // Validation
 // ---------------------------------------------------------------------------
 
-/** Well-formedness contract for a run name: 1-64 chars, leading letter/underscore. */
-export const VALID_NAME = /^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/;
+/** The one numeric source of the run-name length policy — names run 1..MAX_NAME_LENGTH characters. */
+export const MAX_NAME_LENGTH = 64;
+
+/** Well-formedness contract for a run name: 1-MAX_NAME_LENGTH chars, leading letter/underscore. */
+export const VALID_NAME = new RegExp(`^[a-zA-Z_][a-zA-Z0-9_-]{0,${MAX_NAME_LENGTH - 1}}$`);
 
 export function isValidName(name: string): boolean {
 	return VALID_NAME.test(name);

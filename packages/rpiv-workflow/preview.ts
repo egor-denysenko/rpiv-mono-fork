@@ -11,11 +11,44 @@ import type { LoadedWorkflows } from "./load/index.js";
 import { type AnyJudgeSpec, describeFlow, type StageShape } from "./loop-constructors.js";
 import type { SkillContractMap } from "./skill-contract.js";
 
+// ===========================================================================
+// Layout constants — module-local; every column width, gap, and ellipsis the
+// formatters emit flows from here (containment precedent: DESC_TRUNCATE_LEN).
+// ===========================================================================
+
+/** Truncation ellipsis — the ASCII three-period form; the pinned truncation output forbids the single-glyph variant. */
+const TRUNCATION_ELLIPSIS = "...";
+/** Chars the ellipsis occupies inside the truncation cap. */
+const ELLIPSIS_RESERVE = TRUNCATION_ELLIPSIS.length;
+
+/**
+ * Description-truncation cap (characters) for the workflow-list view. Test-pinned
+ * at `preview.test.ts` ("truncates long descriptions at 50 characters with
+ * ellipsis"); the body reserves 3 chars for the trailing "...".
+ */
+const DESC_TRUNCATE_LEN = 50;
+
+/** Stage-index column width in details rows ("1." … "99." keep column alignment). */
+const STAGE_INDEX_WIDTH = 3;
+/**
+ * Stage-kind column width in details rows — layout value carried verbatim (widest
+ * current kind tag is 11 chars); coincidental twin of USAGE_HINT_GAP_WIDTH, never
+ * unified into one shared constant.
+ */
+const STAGE_KIND_WIDTH = 13;
+/** Display-name column width in details rows (stage name plus optional skill attribution). */
+const DISPLAY_NAME_WIDTH = 36;
+/**
+ * Gap between `/wf <workflow>` and the hint text in CMD_USAGE_PREVIEW; coincidental
+ * twin of STAGE_KIND_WIDTH, never unified into one shared constant.
+ */
+const USAGE_HINT_GAP_WIDTH = 13;
+
 /** No-args listing footer — generic usage hint. */
 export const CMD_USAGE_LIST = "Usage: /wf [workflow] <description>";
 
 /** No-args listing footer — preview-mode hint paired with CMD_USAGE_LIST. */
-export const CMD_USAGE_PREVIEW = "/wf <workflow>             — preview stages";
+export const CMD_USAGE_PREVIEW = `/wf <workflow>${" ".repeat(USAGE_HINT_GAP_WIDTH)}— preview stages`;
 
 /** Per-workflow details footer — narrowed to the workflow the user previewed. */
 export const CMD_USAGE_RUN = (name: string) => `Usage: /wf ${name} <description>`;
@@ -25,9 +58,9 @@ export const CMD_USAGE_RUN = (name: string) => `Usage: /wf ${name} <description>
 // ===========================================================================
 
 /** Truncate a description to `maxLen` characters, appending "..." if truncated. */
-function truncateDescription(desc: string, maxLen = 50): string {
+function truncateDescription(desc: string, maxLen = DESC_TRUNCATE_LEN): string {
 	if (desc.length <= maxLen) return desc;
-	return `${desc.slice(0, maxLen - 3)}...`;
+	return `${desc.slice(0, maxLen - ELLIPSIS_RESERVE)}${TRUNCATION_ELLIPSIS}`;
 }
 
 /** No-args listing: every loaded workflow, its stage count, and its source. */
@@ -126,8 +159,8 @@ function formatStageRow(
 	shape: StageShape,
 	edgeDeclared: boolean,
 ): string {
-	const num = `${idx}.`.padEnd(3);
-	const decorations = [stage.kind.padEnd(13), stage.sessionPolicy, outcomeTag(stage)];
+	const num = `${idx}.`.padEnd(STAGE_INDEX_WIDTH);
+	const decorations = [stage.kind.padEnd(STAGE_KIND_WIDTH), stage.sessionPolicy, outcomeTag(stage)];
 	if (stage.inputSchema) decorations.push("in-schema");
 	if (stage.outputSchema) decorations.push("out-schema");
 	if (shape.control.mode !== "single") decorations.push(loopTag(shape.control));
@@ -139,14 +172,12 @@ function formatStageRow(
 	const arrow = formatEdge(shape.edge, edgeDeclared);
 	const trailer = arrow ? `  → ${arrow}` : "";
 
-	return `  ${num} ${displayName.padEnd(36)} ${decorations.join(" · ")}${trailer}`;
+	return `  ${num} ${displayName.padEnd(DISPLAY_NAME_WIDTH)} ${decorations.join(" · ")}${trailer}`;
 }
 
 /**
- * Single tag per stage encoding the outcome shape. Custom outcomes
- * report `custom` (+`snapshot` when the collector declares a snapshot
- * hook, +`parser` when a parser is wired). Stages without an outcome
- * fall through to the framework default: `side-effect` for
+ * Single tag per stage encoding the outcome shape. Stages without an
+ * outcome fall through to the framework default: `side-effect` for
  * side-effect stages (the only kind that has a default); `???` for
  * `produces` (load-time validation rejects this — the tag is for
  * defensive rendering only).
@@ -164,9 +195,7 @@ function outcomeTag(stage: StageDef): string {
 /**
  * Decoration for a loop stage. Assess keeps its exact pre-redesign strings
  * (`assess(judge: skill:<name>)·max=N`, `assess(judge: prompt)·max=N` — the
- * constructor always sets `max`, defaulting to 8). Fanout/iterate gain tags
- * for the first time: `fanout·max=32`, `iterate·max=32`, or the bare kind
- * when no cap is declared (the run-wide maxIterations still backstops).
+ * constructor always sets `max`, defaulting to 8).
  */
 function loopTag(control: StageShape["control"]): string {
 	const spec = control.spec;
@@ -178,33 +207,19 @@ function loopTag(control: StageShape["control"]): string {
 	return spec.max !== undefined ? `${spec.kind}·max=${spec.max}` : spec.kind;
 }
 
-/**
- * Render a judge SLOT for a stage tag: `skill:<name>` / `prompt` for a single
- * judge, or `panel(<N>, <fold>)` for an N-member panel (`fold` is the sugar
- * name or `custom`) — the fan-in surfaces at a glance.
- */
+/** Judge-slot label: skill/prompt/panel. */
 function judgeSlotTag(spec: AnyJudgeSpec): string {
 	if ("panel" in spec) return `panel(${spec.panel.length}, ${spec.fold})`;
 	return spec.skill ? `skill:${spec.skill}` : "prompt";
 }
 
-/**
- * Decoration for a stage that reads ALL accumulated entries of one or more
- * channels via `fanin()` — the fanout-and-synthesize fan-in barrier: `⇉ <names>`.
- * Mirrors the `panel(N, fold)` fan-in surfacing on judge slots — the merge point
- * shows at a glance. Latest-wins (bare-string) reads are unmarked.
- */
+/** Fan-in decoration for `fanin()` all-reads: `⇉ <names>`. */
 function faninTag(shape: StageShape): string | undefined {
 	const allReads = shape.reads?.filter((r) => r.all).map((r) => r.name);
 	return allReads?.length ? `⇉ ${allReads.join(",")}` : undefined;
 }
 
-/**
- * Decoration for a verify-bearing stage: `verify(skill:<name>)` /
- * `verify(prompt)` / `verify(panel(N, fold))`, with the attempt budget appended
- * when retrying (`·attempts=N`); a gate-only verify (the default, max 1) stays
- * compact.
- */
+/** Verify decoration: `verify(<judge>)` + `·attempts=N` when retrying. */
 function verifyTag(v: NonNullable<StageShape["verify"]>): string {
 	const attempts = v.max > 1 ? `·attempts=${v.max}` : "";
 	return `verify(${judgeSlotTag(v)})${attempts}`;
@@ -216,6 +231,11 @@ function verifyTag(v: NonNullable<StageShape["verify"]>): string {
  * explicit `STOP` into one `terminal` mode; the declared-or-not distinction
  * is a one-key lookup the caller supplies (it matters to authors — the
  * validator warns on the undeclared form).
+ *
+ * The "terminal" rendered below is the GRAPH-SINK sense (a stage with no
+ * outgoing edge OR an explicit `STOP`) — NOT the `terminal()` stage factory
+ * (stage-def.ts) and NOT a "terminal failure" run outcome (audit.ts). See the
+ * glossary on `stage-def.ts`'s `terminal` export.
  */
 function formatEdge(edge: StageShape["edge"], declared: boolean): string | undefined {
 	if (edge.mode === "terminal") return declared ? STOP : "(terminal — no edge declared)";

@@ -6,6 +6,7 @@
  * EXECUTION lives in routing.ts — this module is authoring-surface only.
  */
 
+import { markSymbol, readSymbol, requireNonEmptyString, throwInvalid } from "./internal-utils.js";
 import type { Output, RunView } from "./output.js";
 import type { NumericPredicate } from "./predicates.js";
 
@@ -67,12 +68,13 @@ export const READS_DATA: unique symbol = Symbol.for("rpiv.workflow.readsData");
  * declare an `outputSchema` — data-reading routes need a validated output
  * shape; state-only routes don't.
  *
- * Centralises the double-cast required to symbol-key into a function object
- * so consumers don't sprinkle `as unknown as Record<symbol, …>` at every
- * read site.
+ * Delegates the symbol-keyed read to `readSymbol` (`internal-utils.ts`) — the
+ * single home for the function-object symbol-access cast — so consumers read
+ * intent, not mechanics. The `READS_DATA`/`ROUTE_NOTE`/`CANONICAL_FOLD` family
+ * all route through the same `readSymbol`/`markSymbol` pair.
  */
 export function marksReadsData(fn: EdgeFn): boolean {
-	return Boolean((fn as unknown as Record<symbol, boolean>)[READS_DATA]);
+	return Boolean(readSymbol<boolean>(fn, READS_DATA));
 }
 
 /** Options for `defineRoute`. */
@@ -104,7 +106,7 @@ export interface DefineRouteOptions {
  */
 export function defineRoute(targets: readonly string[], fn: EdgePredicate, opts?: DefineRouteOptions): EdgeFn {
 	if (targets.length === 0) {
-		throw new Error("defineRoute: targets must declare at least one possible return value");
+		throwInvalid("defineRoute", "targets must declare at least one possible return value");
 	}
 	// Fresh delegating wrapper — NEVER mutate the caller's function. Reusing
 	// one predicate across two defineRoute calls must not alias their targets
@@ -112,7 +114,7 @@ export function defineRoute(targets: readonly string[], fn: EdgePredicate, opts?
 	// must not inherit a marker a prior call attached.
 	const wrapped: EdgeFn = (ctx) => fn(ctx);
 	wrapped.targets = [...targets];
-	if (opts?.readsData !== false) (wrapped as unknown as Record<symbol, boolean>)[READS_DATA] = true;
+	if (opts?.readsData !== false) markSymbol(wrapped, READS_DATA, true);
 	return wrapped;
 }
 
@@ -123,9 +125,10 @@ export function defineRoute(targets: readonly string[], fn: EdgePredicate, opts?
  * the edge (same tick — single-threaded, no other decision can interleave)
  * and persists it on the `RoutingDecision` row's `note`.
  *
- * Framework plumbing, not authoring surface — NOT re-exported from
- * `registration.ts`. `Symbol.for` so it survives import boundaries, matching
- * `READS_DATA`.
+ * The SYMBOL is framework plumbing — NOT re-exported from `registration.ts`;
+ * bespoke `defineRoute` gates attach notes through `setRouteNote` (the
+ * authoring-surface dual of `takeRouteNote`), which IS re-exported. `Symbol.for`
+ * so it survives import boundaries, matching `READS_DATA`.
  */
 export const ROUTE_NOTE: unique symbol = Symbol.for("rpiv.workflow.routeNote");
 
@@ -134,10 +137,23 @@ export const ROUTE_NOTE: unique symbol = Symbol.for("rpiv.workflow.routeNote");
  * Returns undefined when the edge recorded nothing (the common case).
  */
 export function takeRouteNote(fn: EdgeFn): string | undefined {
-	const slot = fn as unknown as Record<symbol, string | undefined>;
-	const note = slot[ROUTE_NOTE];
-	if (note !== undefined) slot[ROUTE_NOTE] = undefined;
+	const note = readSymbol<string>(fn, ROUTE_NOTE);
+	if (note !== undefined) markSymbol(fn, ROUTE_NOTE, undefined);
 	return note;
+}
+
+/**
+ * Attach a note to an `EdgeFn`'s CURRENT pick — the authoring-surface dual of
+ * `takeRouteNote`, for bespoke `defineRoute` gates (`gate`/`match` attach their
+ * own no-match diagnostics internally). Call it inside the predicate, on the
+ * route about to be returned from — the routing audit reads-and-clears the note
+ * in the same tick and persists it on the `RoutingDecision` row, where
+ * `summarizeRun` surfaces it as a stopped run's reason. A note set on a pick
+ * the audit never reads (e.g. under a test harness) is simply overwritten by
+ * the next call.
+ */
+export function setRouteNote(fn: EdgeFn, note: string): void {
+	markSymbol(fn, ROUTE_NOTE, note);
 }
 
 /**
@@ -146,6 +162,27 @@ export function takeRouteNote(fn: EdgeFn): string | undefined {
  * so an integer-like stage name would silently change match priority.
  */
 const INTEGER_LIKE_KEY = /^\d+$/;
+
+/**
+ * Shared branch-key guards for `gate`/`match`: at least one branch must be
+ * declared, and no key may be integer-like (`"2"`) — JS hoists array-index keys
+ * ahead of declaration order, silently reordering match priority. `factory`
+ * names the throwing builder; `renameHint` is the builder-specific tail of the
+ * integer-key message (gate offers `otherwise`, match does not).
+ */
+function validateBranchKeys(factory: "gate" | "match", branchTargets: string[], renameHint: string): void {
+	if (branchTargets.length === 0) {
+		throwInvalid(factory, "branches must declare at least one possible return value");
+	}
+	for (const key of branchTargets) {
+		if (INTEGER_LIKE_KEY.test(key)) {
+			throwInvalid(
+				factory,
+				`branch key "${key}" is integer-like — JS reorders such keys ahead of declaration order, silently changing match priority. ${renameHint}`,
+			);
+		}
+	}
+}
 
 /**
  * Conditional routing keyed on a numeric field in `output.data`. Each
@@ -173,28 +210,19 @@ const INTEGER_LIKE_KEY = /^\d+$/;
  */
 export function gate(field: string, branches: Record<string, NumericPredicate>, otherwise: string): EdgeFn {
 	const branchTargets = Object.keys(branches);
-	if (branchTargets.length === 0) {
-		throw new Error("gate: branches must declare at least one possible return value");
-	}
-	if (typeof otherwise !== "string" || otherwise.length === 0) {
-		throw new Error("gate: an explicit `otherwise` branch is required — the no-match fallback must be deliberate");
-	}
-	for (const key of branchTargets) {
-		if (INTEGER_LIKE_KEY.test(key)) {
-			throw new Error(
-				`gate: branch key "${key}" is integer-like — JS reorders such keys ahead of declaration order, ` +
-					`silently changing match priority. Rename the stage or route to it via \`otherwise\`.`,
-			);
-		}
-	}
+	validateBranchKeys("gate", branchTargets, "Rename the stage or route to it via `otherwise`.");
+	requireNonEmptyString(
+		otherwise,
+		"gate",
+		"an explicit `otherwise` branch is required — the no-match fallback must be deliberate",
+	);
 	const targets = [...new Set([...branchTargets, otherwise])];
 	const route: EdgeFn = defineRoute(targets, ({ output }) => {
 		const value = Number((output?.data as Record<string, unknown> | undefined)?.[field]);
 		for (const target of branchTargets) {
 			if (branches[target]!(value)) return target;
 		}
-		(route as unknown as Record<symbol, string>)[ROUTE_NOTE] =
-			`gate("${field}"): no branch matched value ${value} — fell back to "${otherwise}"`;
+		markSymbol(route, ROUTE_NOTE, `gate("${field}"): no branch matched value ${value} — fell back to "${otherwise}"`);
 		return otherwise;
 	});
 	return route;
@@ -209,7 +237,7 @@ export interface MatchOptions {
 	 * Stage to route to when no branch value matches. Optional: when omitted, an
 	 * unmatched value TERMINATES the chain (`STOP`). Either way the no-match is a
 	 * visible event — the routing-audit row carries a `note`. Provide a fallback
-	 * to keep the run going on an unexpected value (the roadmap-P4 `triage` shape).
+	 * to keep the run going on an unexpected value (the `triage` shape).
 	 */
 	fallback?: string;
 	/**
@@ -252,25 +280,17 @@ export interface MatchOptions {
  */
 export function match(field: string, branches: Record<string, MatchValue>, opts?: MatchOptions): EdgeFn {
 	const branchTargets = Object.keys(branches);
-	if (branchTargets.length === 0) {
-		throw new Error("match: branches must declare at least one possible return value");
-	}
+	validateBranchKeys("match", branchTargets, "Rename the stage.");
 	const claimedBy = new Map<string, string>();
 	for (const key of branchTargets) {
-		if (INTEGER_LIKE_KEY.test(key)) {
-			throw new Error(
-				`match: branch key "${key}" is integer-like — JS reorders such keys ahead of declaration order, ` +
-					`silently changing match priority. Rename the stage.`,
-			);
-		}
 		// Type-tag the value so 0/"0"/false stay distinct when deduping.
 		const value = branches[key]!;
 		const valueKey = `${typeof value}:${String(value)}`;
 		const prior = claimedBy.get(valueKey);
 		if (prior !== undefined) {
-			throw new Error(
-				`match: value ${JSON.stringify(value)} is claimed by both "${prior}" and "${key}" — ` +
-					`each enum value must map to exactly one stage`,
+			throwInvalid(
+				"match",
+				`value ${JSON.stringify(value)} is claimed by both "${prior}" and "${key}" — each enum value must map to exactly one stage`,
 			);
 		}
 		claimedBy.set(valueKey, key);
@@ -278,7 +298,7 @@ export function match(field: string, branches: Record<string, MatchValue>, opts?
 
 	const fallback = opts?.fallback;
 	if (fallback !== undefined && (typeof fallback !== "string" || fallback.length === 0)) {
-		throw new Error("match: `fallback`, when provided, must be a non-empty stage name");
+		requireNonEmptyString(fallback, "match", "`fallback`, when provided, must be a non-empty stage name");
 	}
 	const noMatch = fallback ?? STOP;
 	const targets = [...new Set([...branchTargets, noMatch])];
@@ -287,6 +307,10 @@ export function match(field: string, branches: Record<string, MatchValue>, opts?
 	const route: EdgeFn = defineRoute(
 		targets,
 		({ output, state }) => {
+			// `.at(-1)` on a PRE-SIZED produces-fanout channel could read a
+			// pending (`undefined`) or failed-sentinel tail. Safe by ordering: routes
+			// fire at `finishLoop`, AFTER `foldFanoutCompletion` has filled every
+			// settled slot, so the channel is never observed half-filled here.
 			const source =
 				from !== undefined
 					? (state.named[from]?.at(-1)?.data as Record<string, unknown> | undefined)
@@ -295,10 +319,13 @@ export function match(field: string, branches: Record<string, MatchValue>, opts?
 			for (const target of branchTargets) {
 				if (raw === branches[target]) return target;
 			}
-			(route as unknown as Record<symbol, string>)[ROUTE_NOTE] =
+			markSymbol(
+				route,
+				ROUTE_NOTE,
 				`match("${field}"): value ${JSON.stringify(raw ?? null)} matched no branch — ${
 					fallback ? `fell back to "${fallback}"` : `terminated (no fallback)`
-				}`;
+				}`,
+			);
 			return noMatch;
 		},
 		// A channel-sourced match validates the CHANNEL's data, not the source

@@ -4,35 +4,15 @@
  * run's JSONL trail and re-enters the chain at the right seam. Per-stage
  * work (sessions, extraction, validation, audit row writes) lives in
  * sessions.ts + audit.ts; this directory owns graph traversal, per-stage
- * prerequisites, and routing.
+ * prerequisites, and routing; imports point strictly downward — the walk's
+ * mutual recursion is composed by injection in run-stage.ts, never as a
+ * module cycle.
  *
- * Modules (imports point strictly downward — the walk's mutual recursion is
- * composed by injection in run-stage.ts, never as a module cycle):
- *  - runner.ts          — runWorkflow + resumeWorkflow + executeRun (shared
- *                         tail).
- *  - run-stage.ts — runStage (mode dispatch) + runStageOrRecordFailure
- *                         (single catch site) + the walk composition.
- *  - chain-advance.ts   — advanceChain + routing audit + backward-jump
- *                         guard + halt-on-error (ChainDeps-injected).
- *  - resolve-stage.ts   — ResolvedStage: mode/dispatch derived once.
- *  - preflight.ts       — runtime preflights (throw StagePreflightError).
- *  - input-validation.ts— schema-backed input preflights.
- *  - script-stage.ts    — skillless TS-stage runtime (no session/collector).
- *  - failure.ts         — ChainOutcome + entry-throw → failure-row + finalize.
- *  - run-context.ts     — RunContext/RunState construction + policy caps.
- *  - errors.ts          — StagePreflightError.
- *  - resume.ts          — reconstructState: pure RunState rebuild from a
- *                         past run's JSONL trail (consumed by resumeWorkflow).
- *  - resume-entry.ts    — trail trailer → chain re-entry thunk + refusal text.
- *  - resume-loop.ts     — loop-trailer re-entry + drift refusals.
- *
- * Ctx lifecycle: every level only touches the ctx it was handed.
- * - `newSession({cancelled: false})` invalidates the outer ctx; all
- *   further work runs on `freshCtx` inside `withSession`, and the
- *   outer function simply unwinds.
- * - `cancelled: true` means no replacement happened — outer ctx remains
- *   valid.
- * - Continue policy has no newSession — same ctx throughout.
+ * Ctx lifecycle: the launcher ctx threaded into `runWorkflow`/`resumeWorkflow`
+ * STAYS VALID for the whole run — it is never swapped. Every stage runs in its
+ * own detached child session opened via `ctx.spawnChild({ withSession })`; the
+ * parent ctx only observes (progress, status). Continue policy spawns a child
+ * like any other stage — its only divergence is the preserved branch offset.
  *
  * Vocabulary: "stage" = one stage activation in this run; "phase" = one
  * `## Phase N:` subdivision inside an implement plan artifact.
@@ -41,8 +21,9 @@
 import type { Workflow } from "../api.js";
 import { currentPrimaryArtifact } from "../chain-state.js";
 import { type LifecycleListeners, lifecycleCtxFor } from "../events.js";
+import { getWorkflowExecutionProvider } from "../execution-host.js";
 import { handleToString } from "../handle.js";
-import type { WorkflowHost, WorkflowHostContext } from "../host.js";
+import type { ModelSelection, WorkflowHost, WorkflowHostContext } from "../host.js";
 import { nowIso } from "../internal-utils.js";
 import {
 	MSG_HEADER_WRITE_FAILED,
@@ -50,21 +31,25 @@ import {
 	MSG_NAME_INDEX_WRITE_FAILED,
 	MSG_NAME_INVALID,
 } from "../messages.js";
+import { pruneOrphanedChildSessions } from "../sessions/index.js";
 import {
+	appendHeader,
 	type ClaimResult,
 	claimName,
 	generateRunId,
+	readAllStages,
 	releaseName,
 	STATE_SCHEMA_VERSION,
 	type WorkflowHeader,
-	writeHeader,
 } from "../state/index.js";
+import { childSessionsDir } from "../state/paths.js";
+import type { BranchEntry } from "../transcript.js";
 import { DEFAULT_TRIGGER } from "../triggers.js";
 import type { RunContext, RunWorkflowOptions, RunWorkflowResult } from "../types.js";
 import { reconstructState } from "./resume.js";
 import { resumeRefusalError, selectResumeEntry } from "./resume-entry.js";
-import { buildRunContext, freshRunState } from "./run-context.js";
-import { runStageOrRecordFailure } from "./run-stage.js";
+import { buildRunContext, freshRunState, validateRunBudgets } from "./run-context.js";
+import { dispatchStageOrRecordFailure } from "./run-stage.js";
 
 // ---------------------------------------------------------------------------
 // Shared tail — executeRun
@@ -84,6 +69,12 @@ async function executeRun(
 	await run.lifecycle.fire(ctx, "onWorkflowStart", lifecycleCtxFor(run));
 
 	await entry();
+
+	// Run settled — every child torn down, every row persisted. Sweep child-session
+	// files no row references (chiefly a `continue` fork whose stage threw before its
+	// first row write — the failure row pins session:null, orphaning the fork). Safe:
+	// resume only reattaches/forks files a persisted row references. Best-effort.
+	pruneOrphanedChildSessions(run.cwd, run.runId, referencedSessionIds(run));
 
 	const { state } = run;
 	const result: RunWorkflowResult = {
@@ -108,6 +99,92 @@ async function executeRun(
 	return result;
 }
 
+/**
+ * The keep-set for the run-end orphan sweep. Failed/aborted rows that carry a
+ * session are reattach targets on resume, so every row's `session.id` is read
+ * from the durable trail (success OR failure) and unioned with `lastSession`
+ * (the live predecessor a resumed `continue` would fork). Anything NOT here is
+ * a child-session file no row points at — safe to delete.
+ */
+function referencedSessionIds(run: RunContext): Set<string> {
+	const ids = new Set<string>();
+	for (const row of readAllStages(run.cwd, run.runId)) {
+		if (row.session) ids.add(row.session.id);
+	}
+	if (run.state.lastSession) ids.add(run.state.lastSession.id);
+	return ids;
+}
+
+/** What `detachExecutor` resolves: the executor ctx to run against, the
+ *  per-stage model resolver + abort signal to thread onto `RunContext`, and the
+ *  teardown the caller invokes in `finally`. */
+interface DetachedExecutor {
+	execCtx: WorkflowHostContext;
+	resolveModel?: (id: { workflow: string; stage: string; skill: string }) => ModelSelection | undefined;
+	readSessionBranch?: (file: string) => BranchEntry[] | undefined;
+	signal?: AbortSignal;
+	dispose?: () => void;
+}
+
+/**
+ * Detach to the executor host — the SHARED detach BOTH entry points run through,
+ * so a resumed stage's `spawnChild` / reattach / fork runs against the SAME real
+ * executor as a live run. Building the host HERE for both paths keeps resume
+ * off the bare launcher ctx (a `WorkflowLauncherContext` with no
+ * `spawnChild`/`maxConcurrency`) — the only place such a gap could hide is a
+ * test injecting a `spawnChild` directly.
+ *
+ * Threads the provider's `resolveModel` + abort `signal` too, so resumed children
+ * get per-stage models and cooperative cancellation exactly like live. The
+ * `childSessionsDir` is keyed by `runId`, so a resume reuses the SAME run-scoped
+ * dir the original run persisted its children into — what reattach/fork resolve
+ * against.
+ *
+ * No provider ⇒ execute on the live `ctx` (graceful degrade for non-Pi embedders
+ * / tests — the caller is contracted to pass an executor-capable ctx there).
+ * `dispose` unsubscribes the keystroke tap; the caller MUST call it in `finally`.
+ */
+async function detachExecutor(
+	ctx: WorkflowHostContext,
+	cwd: string,
+	runId: string,
+	options: {
+		resolveModel?: (id: { workflow: string; stage: string; skill: string }) => ModelSelection | undefined;
+		readSessionBranch?: (file: string) => BranchEntry[] | undefined;
+		signal?: AbortSignal;
+		name?: string; // lane display name (run --name ?? workflow name)
+		/** Workflow name (the dock's dim `workflow:` tag); threaded from workflow.name / header.workflow. */
+		workflow?: string;
+		/** The run's original input (user prompt); threaded from options.input / header.input. */
+		input?: string;
+	},
+): Promise<DetachedExecutor> {
+	const provider = getWorkflowExecutionProvider();
+	if (!provider)
+		return {
+			execCtx: ctx,
+			resolveModel: options.resolveModel,
+			readSessionBranch: options.readSessionBranch,
+			signal: options.signal,
+		};
+	// Resolve the run-scoped session dir here (internal layout helper) and hand the
+	// provider a concrete string; rpiv-pi never imports childSessionsDir.
+	const exec = await provider.createHost(ctx, {
+		runId,
+		childSessionsDir: childSessionsDir(cwd, runId),
+		name: options.name, // rpiv-pi records the lane under this name
+		workflow: options.workflow, // dock tag (the workflow name)
+		input: options.input, // dock descriptor (the user prompt)
+	});
+	return {
+		execCtx: exec.host,
+		dispose: exec.dispose,
+		resolveModel: options.resolveModel ?? provider.resolveModel,
+		readSessionBranch: options.readSessionBranch ?? provider.readSessionBranch,
+		signal: options.signal ?? exec.signal, // provider-owned abort handle
+	};
+}
+
 // ---------------------------------------------------------------------------
 // runWorkflow — workflow entry point
 // ---------------------------------------------------------------------------
@@ -125,9 +202,9 @@ function nameClaimError(name: string, claim: Extract<ClaimResult, { ok: false }>
 }
 
 /**
- * Each subsequent `newSession()` is invoked on the freshCtx returned by the
- * previous withSession — never on a captured outer ctx (which Pi invalidates
- * as soon as the session is replaced).
+ * Walks the workflow's edge graph from `workflow.start`. The launcher `ctx`
+ * stays valid throughout — each stage opens (and disposes) its own detached
+ * child session via `spawnChild`, so the outer ctx is never swapped.
  */
 export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflowOptions): Promise<RunWorkflowResult> {
 	const { workflow } = options;
@@ -139,8 +216,11 @@ export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflow
 		};
 	}
 
-	const continueGuard = hostMissingForContinueStages(workflow, options.host);
-	if (continueGuard) return { stagesCompleted: 0, success: false, error: continueGuard };
+	// A malformed budget (`NaN`, a negative, a fraction) would make a ledger
+	// compare fail open — refused here, before the name claim and the header,
+	// so nothing is written for a run that could never halt.
+	const budgetError = validateRunBudgets(options);
+	if (budgetError !== undefined) return { stagesCompleted: 0, success: false, error: budgetError };
 
 	const cwd = ctx.cwd;
 	const runId = generateRunId();
@@ -158,7 +238,7 @@ export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflow
 	// makes the run unlistable and unresumable while its stage rows land, so a
 	// failed append rejects the start and rolls back the name claim (the index
 	// must not point at a run that never existed).
-	const headerWritten = writeHeader(cwd, {
+	const headerWritten = appendHeader(cwd, {
 		runId,
 		workflow: workflow.name,
 		input: options.input,
@@ -172,14 +252,33 @@ export async function runWorkflow(ctx: WorkflowHostContext, options: RunWorkflow
 		return { stagesCompleted: 0, success: false, error: MSG_HEADER_WRITE_FAILED(runId) };
 	}
 
-	const run = buildRunContext(cwd, workflow, options, {
-		runId,
-		state: freshRunState(options.input),
-		visited: new Set(),
-		trigger,
+	// Detach to the executor host (the executor relays UI back to the live session).
+	const { execCtx, resolveModel, readSessionBranch, signal, dispose } = await detachExecutor(ctx, cwd, runId, {
+		...options,
+		name: options.name ?? workflow.name,
+		workflow: workflow.name,
+		input: options.input,
 	});
 
-	return executeRun(ctx, run, () => runStageOrRecordFailure(ctx, workflow.start, 0, run));
+	// `buildRunContext` is INSIDE the try so a throw there (e.g. countReachableStages
+	// on a malformed EdgeFn that bypassed load-time validation) still runs `dispose`
+	// — otherwise the onTerminalInput tap leaks, accumulating one per failed run.
+	try {
+		const run = buildRunContext(
+			cwd,
+			workflow,
+			{ ...options, resolveModel, readSessionBranch, signal },
+			{
+				runId,
+				state: freshRunState(options.input),
+				visited: new Set(),
+				trigger,
+			},
+		);
+		return await executeRun(execCtx, run, () => dispatchStageOrRecordFailure(execCtx, workflow.start, 0, run));
+	} finally {
+		dispose?.(); // unsubscribe the onTerminalInput tap — leaks accumulate on the TUI otherwise
+	}
 }
 
 export interface ResumeWorkflowOptions {
@@ -187,10 +286,18 @@ export interface ResumeWorkflowOptions {
 	workflow: Workflow;
 	/** Header of the run to resume — caller resolves via `resolveRun`. */
 	header: WorkflowHeader;
-	/** Required for "continue"-policy stages (host.sendUserMessage). */
+	/** Registry-level host — enumerated once for the skill-registration snapshot. */
 	host?: WorkflowHost;
-	/** Defaults to MAX_BACKWARD_JUMPS. */
+	/** Per-destination decision-edge re-entry cap. Defaults to MAX_BACKWARD_JUMPS. */
 	maxBackwardJumps?: number;
+	/**
+	 * Per-destination ABSOLUTE ceiling on decision-edge re-entries — counts
+	 * every re-entry (improved-waived laps included), unlike the waive-aware
+	 * `maxBackwardJumps` cap. The `maxLaps + 1`-th re-entry of one stage
+	 * halts. Defaults to MAX_LAPS; fresh per invocation (a resume starts
+	 * both re-entry ledgers empty).
+	 */
+	maxLaps?: number;
 	/** Run-wide safety cap on loop units (all kinds). Defaults to MAX_ITERATIONS. */
 	maxIterations?: number;
 	/** The user's `@<ref>` — surfaced in trigger.meta + refusal messages. */
@@ -199,6 +306,14 @@ export interface ResumeWorkflowOptions {
 	lifecycle?: LifecycleListeners;
 	/** Cooperative cancellation — see `RunWorkflowOptions.signal`. */
 	signal?: AbortSignal;
+	/**
+	 * Per-stage model-override resolver — see `RunWorkflowOptions.resolveModel`.
+	 * Resumed stages resolve per-child models exactly like live; when omitted the
+	 * detached executor's own `provider.resolveModel` is used (so a resume from the
+	 * Pi launcher still honors per-skill overrides without the caller re-threading
+	 * it). Undefined + no provider ⇒ host default for every resumed stage.
+	 */
+	resolveModel?: (id: { workflow: string; stage: string; skill: string }) => ModelSelection | undefined;
 }
 
 /**
@@ -217,6 +332,12 @@ export async function resumeWorkflow(
 	const { workflow, header } = options;
 	const cwd = ctx.cwd;
 
+	// Same pre-flight refusal as `runWorkflow` — a resume threads the same
+	// budget options and appends to the same trail, so a malformed budget is
+	// refused before any row lands.
+	const budgetError = validateRunBudgets(options);
+	if (budgetError !== undefined) return { stagesCompleted: 0, success: false, error: budgetError };
+
 	const recon = await reconstructState(cwd, workflow, header);
 	if (!recon.ok) {
 		// Pure envelope — no self-notify, mirroring `runWorkflow`'s pre-flight
@@ -227,32 +348,36 @@ export async function resumeWorkflow(
 		return { stagesCompleted: 0, success: false, error: resumeRefusalError(recon, header.workflow) };
 	}
 
-	const continueGuard = hostMissingForContinueStages(workflow, options.host);
-	if (continueGuard) return { stagesCompleted: 0, success: false, error: continueGuard };
-
-	const run = buildRunContext(cwd, workflow, options, {
-		runId: header.runId, // SAME run — new rows append to the same file
-		state: recon.state,
-		visited: recon.visited,
-		trigger: { kind: "command", name: "wf", meta: { resumedFrom: options.ref } },
+	// Detach to the executor host — the SAME wiring as live (resume-detach
+	// parity). After the
+	// reconstruct refusal so a refused resume builds no host, but BEFORE
+	// `buildRunContext`/`executeRun` so every resumed stage (single-stage reattach,
+	// pending-fanout re-dispatch, or a cold-routed continue fork) runs against the
+	// real executor, not the bare launcher ctx. Same run id ⇒ same childSessionsDir,
+	// so reattach/fork resolve the original run's persisted child sessions.
+	const { execCtx, resolveModel, readSessionBranch, signal, dispose } = await detachExecutor(ctx, cwd, header.runId, {
+		...options,
+		name: header.name ?? header.workflow,
+		workflow: header.workflow,
+		input: header.input,
 	});
 
-	return executeRun(ctx, run, selectResumeEntry(ctx, recon, run));
-}
-
-// ---------------------------------------------------------------------------
-// Entry helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Continue-policy stages thread the prior session via the host's
- * `sendUserMessage`; with no host, `enforceSessionInvariants` would throw at
- * the first such stage. Reject at workflow entry so embedders get a clean
- * envelope instead of a throw. Returns the error message, or undefined if the
- * workflow is safe to run.
- */
-function hostMissingForContinueStages(workflow: Workflow, host: WorkflowHost | undefined): string | undefined {
-	if (host !== undefined) return undefined;
-	if (!Object.values(workflow.stages).some((s) => s.sessionPolicy === "continue")) return undefined;
-	return "workflow contains continue-policy stages which require a workflow host";
+	// `buildRunContext` + `selectResumeEntry` are INSIDE the try so a throw in either
+	// still runs `dispose` (tap-leak parity with `runWorkflow`).
+	try {
+		const run = buildRunContext(
+			cwd,
+			workflow,
+			{ ...options, resolveModel, readSessionBranch, signal },
+			{
+				runId: header.runId, // SAME run — new rows append to the same file
+				state: recon.state,
+				visited: recon.visited,
+				trigger: { kind: "command", name: "wf", meta: { resumedFrom: options.ref } },
+			},
+		);
+		return await executeRun(execCtx, run, selectResumeEntry(execCtx, recon, run));
+	} finally {
+		dispose?.(); // unsubscribe the onTerminalInput tap — parity with runWorkflow
+	}
 }

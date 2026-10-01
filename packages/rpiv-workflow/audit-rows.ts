@@ -87,6 +87,24 @@ export function applyStageSuccess(state: RunState, def: StageDef, stageName: str
 }
 
 /**
+ * Roll the predecessor session forward after a single-stage success so a
+ * downstream `continue` stage forks it. THE single authority for this slot's
+ * write rule — the live success path (`recordStageSuccess`, sessions.ts) and the
+ * resume fold (`foldKnownStage`, resume.ts) both call it, so the null-handling
+ * can't drift between them.
+ *
+ * A `null` session (sessionless paths — script + side-effect stages persist
+ * `session: null`) LEAVES the slot untouched: those stages are transparent to
+ * the continuation chain, so a `continue` after one forks the most recent
+ * SESSION-BEARING predecessor on both live and resume. Loop-unit rows never
+ * reach here (they take the `s.unit` / `foldUnitRow` branch and never seed a
+ * continuation).
+ */
+export function rollLastSession(state: RunState, session: SessionRef | null | undefined): void {
+	if (session != null) state.lastSession = session;
+}
+
+/**
  * Persist a completed stage's success row, then apply its state effects —
  * the ONE live-path success persistence (skill sessions + script stages).
  * Returns `true` iff the JSONL row landed; on `false` the state is left at
@@ -112,6 +130,12 @@ export function persistStageSuccess(
 		unit?: UnitRef;
 		/** The activation's pre-allocated number (output-producing paths). */
 		preAllocated?: number;
+		/**
+		 * Strike history — written onto the completed row ONLY when the caller
+		 * supplies it (a session that consumed bash strikes). Zero strikes ⇒ the
+		 * caller omits it ⇒ spread below contributes nothing ⇒ byte-identical row.
+		 */
+		bashTimeoutStrikes?: { count: number; reasons: string[] };
 	},
 	def: StageDef,
 ): boolean {
@@ -126,6 +150,10 @@ export function persistStageSuccess(
 			output: row.output,
 			session: row.session,
 			...unitRowFields(row.unit),
+			// Propagate the additive strike-history field onto the persisted
+			// completed WorkflowStage row ONLY when the caller supplied it (zero strikes
+			// ⇒ undefined ⇒ spread contributes nothing ⇒ byte-identical row).
+			...(row.bashTimeoutStrikes ? { bashTimeoutStrikes: row.bashTimeoutStrikes } : {}),
 		},
 		state,
 		row.preAllocated,
